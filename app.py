@@ -140,35 +140,62 @@ TICKER_ROW = {
 }
 
 # ── Data layer ────────────────────────────────────────────────
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flatten the MultiIndex yfinance returns for single symbols,
+    keep only OHLCV, drop NaNs.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # yfinance ≥0.2.38 returns MultiIndex (Attribute, Ticker) for single symbols too
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    # Keep standard columns only
+    wanted = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    df = df[wanted].copy()
+    df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
+    return df.dropna()
+
+
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample a clean OHLCV DataFrame using the dict agg syntax (works on all pandas versions)."""
+    agg_dict = {
+        "Open":   "first",
+        "High":   "max",
+        "Low":    "min",
+        "Close":  "last",
+        "Volume": "sum",
+    }
+    return df.resample(rule).agg(agg_dict).dropna()
+
+
 @st.cache_data(ttl=60)
 def fetch_data(symbol: str) -> dict | None:
     """Fetch 15m, 30m, 1h candles plus daily for 24h metrics."""
     try:
-        raw_15m = yf.download(symbol, period="5d",  interval="15m", progress=False)
-        raw_1h  = yf.download(symbol, period="30d", interval="1h",  progress=False)
-        raw_1d  = yf.download(symbol, period="6mo", interval="1d",  progress=False)
+        raw_15m = yf.download(symbol, period="5d",  interval="15m", progress=False, auto_adjust=True)
+        raw_1h  = yf.download(symbol, period="30d", interval="1h",  progress=False, auto_adjust=True)
+        raw_1d  = yf.download(symbol, period="6mo", interval="1d",  progress=False, auto_adjust=True)
 
-        def _clean(df):
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            return df.dropna()
-
-        raw_15m, raw_1h, raw_1d = _clean(raw_15m), _clean(raw_1h), _clean(raw_1d)
+        raw_15m = _clean_df(raw_15m)
+        raw_1h  = _clean_df(raw_1h)
+        raw_1d  = _clean_df(raw_1d)
 
         if raw_15m.empty or raw_1h.empty:
+            st.error(f"No data returned for **{symbol}**. "
+                     "Check the symbol is correct (e.g. `BTC-USD`, `GC=F`, `AAPL`).")
             return None
 
         data = {
             "15m": raw_15m,
-            "30m": raw_15m.resample("30min").agg(
-                Open="first", High="max", Low="min", Close="last", Volume="sum"
-            ).dropna(),
+            "30m": _resample_ohlcv(raw_15m, "30min"),
             "1h":  raw_1h,
             "1d":  raw_1d,
         }
         return data
     except Exception as e:
-        st.error(f"Download error for {symbol}: {e}")
+        st.error(f"Download error for **{symbol}**: {e}")
         return None
 
 
@@ -178,16 +205,20 @@ def fetch_ticker_row() -> dict:
     result = {}
     for name, sym in TICKER_ROW.items():
         try:
-            t = yf.Ticker(sym)
-            h = t.history(period="2d", interval="1d")
+            raw = yf.download(sym, period="2d", interval="1d",
+                              progress=False, auto_adjust=True)
+            h = _clean_df(raw)
             if len(h) >= 2:
                 price = float(h["Close"].iloc[-1])
                 prev  = float(h["Close"].iloc[-2])
                 chg   = (price - prev) / prev * 100
+            elif len(h) == 1:
+                price = float(h["Close"].iloc[-1])
+                chg   = 0.0
             else:
                 price, chg = 0.0, 0.0
             result[name] = {"price": price, "change": chg}
-        except:
+        except Exception:
             result[name] = {"price": 0.0, "change": 0.0}
     return result
 
@@ -216,11 +247,16 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["MACD_Sig"]  = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_Hist"] = df["MACD"] - df["MACD_Sig"]
 
-    # ATR
-    hl  = df["High"] - df["Low"]
-    hcp = (df["High"] - df["Close"].shift()).abs()
-    lcp = (df["Low"]  - df["Close"].shift()).abs()
-    df["ATR"] = pd.concat([hl, hcp, lcp], axis=1).max(axis=1).rolling(14).mean()
+    # ATR  — use numpy to avoid any Series alignment issues
+    hi  = df["High"].values
+    lo  = df["Low"].values
+    cl  = df["Close"].values
+    hl  = hi - lo
+    hcp = np.abs(hi[1:] - cl[:-1])
+    lcp = np.abs(lo[1:] - cl[:-1])
+    tr  = np.concatenate([[hl[0]], np.maximum(hl[1:], np.maximum(hcp, lcp))])
+    atr_series = pd.Series(tr, index=df.index).rolling(14).mean()
+    df["ATR"] = atr_series
 
     # ADX
     pdm = df["High"].diff().clip(lower=0)
