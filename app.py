@@ -1,951 +1,1091 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║          PRO AI TRADING DASHBOARD  —  powered by yfinance   ║
+║  EMA 100/200 | 15m Scalping | 30m+1h Intraday | Backtesting ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import time
+from plotly.subplots import make_subplots
+from datetime import datetime
 from scipy import stats
-import requests
+import time
 
-# Try to import feedparser, use fallback if not available
 try:
     import feedparser
-    FEEDPARSER_AVAILABLE = True
+    _FEED = True
 except ImportError:
-    FEEDPARSER_AVAILABLE = False
+    _FEED = False
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Pro AI Trader Ultimate", layout="wide")
+# ── Page config ───────────────────────────────────────────────
+st.set_page_config(
+    page_title="Pro AI Trader",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# --- CUSTOM CSS ---
+# ── CSS ───────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .metric-card {background-color: #0e1117; border: 1px solid #303030; padding: 20px; border-radius: 10px; margin-bottom: 10px;}
-    .bullish {color: #00ff00; font-weight: bold;}
-    .bearish {color: #ff4b4b; font-weight: bold;}
-    .price-ticker {
-        background: linear-gradient(90deg, #1e1e1e 0%, #2d2d2d 100%);
-        padding: 15px;
-        border-radius: 10px;
-        margin: 10px 0;
-        border-left: 4px solid #00ff00;
-    }
-    .prediction-box {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 20px;
-        border-radius: 12px;
-        color: white;
-        margin: 15px 0;
-    }
-    .signal-strong-buy {
-        background-color: #00ff00;
-        color: black;
-        padding: 8px 15px;
-        border-radius: 5px;
-        font-weight: bold;
-    }
-    .signal-strong-sell {
-        background-color: #ff4b4b;
-        color: white;
-        padding: 8px 15px;
-        border-radius: 5px;
-        font-weight: bold;
-    }
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;600&display=swap');
+
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+
+.stApp { background: #080c12; }
+
+/* Ticker card */
+.ticker-card {
+    background: linear-gradient(135deg,#0f1923 0%,#131f2e 100%);
+    border: 1px solid #1e2d3d;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 6px;
+    transition: border-color .2s;
+}
+.ticker-card:hover { border-color: #2a9d8f; }
+.ticker-name  { font-size:11px; color:#6b8cad; letter-spacing:.08em; text-transform:uppercase; }
+.ticker-price { font-family:'Space Mono',monospace; font-size:20px; font-weight:700; color:#e8f4f8; margin:4px 0; }
+.ticker-chg   { font-size:13px; font-weight:600; }
+.up   { color:#2a9d8f; }
+.down { color:#e76f51; }
+
+/* Master signal cards */
+.msig {
+    border-radius:16px;
+    padding:24px 20px;
+    text-align:center;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+    transition: transform .15s;
+}
+.msig:hover { transform: translateY(-2px); }
+.msig-label { font-size:12px; letter-spacing:.12em; text-transform:uppercase; opacity:.8; margin-bottom:4px; }
+.msig-signal { font-family:'Space Mono',monospace; font-size:26px; font-weight:700; margin:8px 0; }
+.msig-score  { font-size:14px; opacity:.85; }
+
+.sig-strong-buy  { background:linear-gradient(135deg,#1a4731,#2a9d8f); color:#c8ffe8; }
+.sig-buy         { background:linear-gradient(135deg,#1a3a2a,#4caf7d); color:#d0ffe0; }
+.sig-neutral     { background:linear-gradient(135deg,#2a2a1a,#a08c2a); color:#fff5c0; }
+.sig-sell        { background:linear-gradient(135deg,#3a1a1a,#c0522a); color:#ffd0c0; }
+.sig-strong-sell { background:linear-gradient(135deg,#3a0f0f,#e76f51); color:#ffc8c8; }
+
+/* TF column */
+.tf-box {
+    background:#0f1923;
+    border:1px solid #1e2d3d;
+    border-radius:10px;
+    padding:12px;
+    margin-bottom:4px;
+    font-size:13px;
+}
+
+/* Trade box */
+.trade-long  { background:linear-gradient(180deg,#0d2318 0%,#0a1a12 100%); border:1px solid #2a9d8f; border-radius:12px; padding:16px; }
+.trade-short { background:linear-gradient(180deg,#230d0d 0%,#1a0a0a 100%); border:1px solid #e76f51; border-radius:12px; padding:16px; }
+.trade-none  { background:#0f1923; border:1px solid #1e2d3d; border-radius:12px; padding:16px; color:#6b8cad; text-align:center; }
+
+/* Conflict badges */
+.badge-crit   { background:#3a0f0f; border-left:3px solid #e76f51; border-radius:6px; padding:10px 14px; margin:6px 0; font-size:13px; }
+.badge-warn   { background:#2a2200; border-left:3px solid #e9c46a; border-radius:6px; padding:10px 14px; margin:6px 0; font-size:13px; }
+.badge-ok     { background:#0a2318; border-left:3px solid #2a9d8f; border-radius:6px; padding:10px 14px; margin:6px 0; font-size:13px; }
+
+/* News card */
+.news-card { background:#0f1923; border:1px solid #1e2d3d; border-radius:8px; padding:12px 14px; margin-bottom:8px; }
+.news-title { font-size:13px; font-weight:600; color:#d0e8f8; margin-bottom:4px; line-height:1.4; }
+.news-meta  { font-size:11px; color:#4a6a8a; }
+
+/* Divider */
+hr { border-color:#1e2d3d !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- SESSION STATE ---
-if 'last_refresh' not in st.session_state:
-    st.session_state.last_refresh = datetime.now()
-if 'auto_refresh' not in st.session_state:
-    st.session_state.auto_refresh = True
-if 'current_symbol' not in st.session_state:
-    st.session_state.current_symbol = 'BINANCE:BTCUSDT'
-if 'view_mode' not in st.session_state:
-    st.session_state.view_mode = 'Single Asset'
-if 'symbol_1' not in st.session_state:
-    st.session_state.symbol_1 = 'BINANCE:BTCUSDT'
-if 'symbol_2' not in st.session_state:
-    st.session_state.symbol_2 = 'OANDA:XAU_USD'
-if 'finnhub_api_key' not in st.session_state:
-    st.session_state.finnhub_api_key = ''
+# ── Session state ─────────────────────────────────────────────
+_defaults = {
+    "symbol": "BTC-USD",
+    "sym1": "BTC-USD",
+    "sym2": "GC=F",
+    "view": "Single Asset",
+    "show_bt": False,
+    "refreshed_at": datetime.now(),
+    "auto": True,
+}
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ============================================================
-# FINNHUB API — SMART ROUTER
-# Crypto  → /crypto/candle   (symbol like BINANCE:BTCUSDT)
-# Forex   → /forex/candle    (symbol like OANDA:XAU_USD)
-# Stock   → /stock/candle    (symbol like AAPL)
-# Quote   → /quote           (stocks) | /crypto/profile2 (crypto)
-# ============================================================
-
-# Symbols the live-ticker will display and the correct Finnhub format
-TICKER_SYMBOLS = {
-    'Bitcoin':      {'finnhub': 'BINANCE:BTCUSDT',  'type': 'crypto'},
-    'Gold':         {'finnhub': 'OANDA:XAU_USD',     'type': 'forex'},
-    'Silver':       {'finnhub': 'OANDA:XAG_USD',     'type': 'forex'},
-    'Dollar Idx':   {'finnhub': 'OANDA:USD_CHF',     'type': 'forex'},
-    'XRP':          {'finnhub': 'BINANCE:XRPUSDT',   'type': 'crypto'},
+# ── Symbol catalogue ──────────────────────────────────────────
+QUICK = {
+    "BTC":    "BTC-USD",
+    "ETH":    "ETH-USD",
+    "XRP":    "XRP-USD",
+    "Gold":   "GC=F",
+    "Silver": "SI=F",
+    "Oil":    "CL=F",
+    "EUR/USD":"EURUSD=X",
+    "DXY":    "DX-Y.NYB",
+    "S&P 500":"^GSPC",
+    "NVDA":   "NVDA",
 }
 
-def _symbol_type(symbol: str) -> str:
-    """Detect whether a symbol is crypto, forex, or stock."""
-    s = symbol.upper()
-    if ':' in s:
-        exchange = s.split(':')[0]
-        forex_exchanges = {'OANDA', 'FXCM', 'FX', 'FOREXCOM', 'IC MARKETS'}
-        if exchange in forex_exchanges:
-            return 'forex'
-        return 'crypto'          # BINANCE, COINBASE, KRAKEN, etc.
-    return 'stock'               # bare tickers like AAPL, TSLA
+TICKER_ROW = {
+    "Bitcoin": "BTC-USD",
+    "Gold":    "GC=F",
+    "Silver":  "SI=F",
+    "DXY":     "DX-Y.NYB",
+    "XRP":     "XRP-USD",
+}
 
-def _candle_url(sym_type: str) -> str:
-    if sym_type == 'forex':
-        return 'https://finnhub.io/api/v1/forex/candle'
-    elif sym_type == 'stock':
-        return 'https://finnhub.io/api/v1/stock/candle'
-    else:
-        return 'https://finnhub.io/api/v1/crypto/candle'
-
-def _finnhub_get(url, params, timeout=12):
-    """Wrapper — returns (data_dict | None, error_str | None)."""
+# ── Data layer ────────────────────────────────────────────────
+@st.cache_data(ttl=60)
+def fetch_data(symbol: str) -> dict | None:
+    """Fetch 15m, 30m, 1h candles plus daily for 24h metrics."""
     try:
-        r = requests.get(url, params=params, timeout=timeout)
-        if r.status_code == 401:
-            return None, "❌ Invalid API key — check the key you entered."
-        if r.status_code == 429:
-            return None, "⏳ Rate limit hit — wait 60 s then refresh."
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}: {r.text[:120]}"
-        return r.json(), None
-    except requests.exceptions.ConnectionError:
-        return None, "🔌 Network error — cannot reach finnhub.io"
-    except Exception as e:
-        return None, str(e)
+        raw_15m = yf.download(symbol, period="5d",  interval="15m", progress=False)
+        raw_1h  = yf.download(symbol, period="30d", interval="1h",  progress=False)
+        raw_1d  = yf.download(symbol, period="6mo", interval="1d",  progress=False)
 
-def get_finnhub_candles(symbol, resolution, from_ts, to_ts, api_key):
-    """
-    Fetch OHLCV candles from the correct Finnhub endpoint.
-    resolution: '15', '30', '60'  (minutes) or 'D'
-    Returns a DataFrame or None.
-    """
-    sym_type = _symbol_type(symbol)
-    url      = _candle_url(sym_type)
+        def _clean(df):
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df.dropna()
 
-    params = {
-        'symbol':     symbol,
-        'resolution': resolution,
-        'from':       int(from_ts),
-        'to':         int(to_ts),
-        'token':      api_key,
-    }
+        raw_15m, raw_1h, raw_1d = _clean(raw_15m), _clean(raw_1h), _clean(raw_1d)
 
-    data, err = _finnhub_get(url, params)
-    if err:
-        return None, err
-
-    status = data.get('s', 'no_data')
-    if status != 'ok':
-        hint = ""
-        if status == 'no_data':
-            hint = " (market may be closed or symbol unsupported on free tier)"
-        return None, f"Finnhub returned '{status}'{hint} for {symbol}"
-
-    df = pd.DataFrame({
-        'Open':   data['o'],
-        'High':   data['h'],
-        'Low':    data['l'],
-        'Close':  data['c'],
-        'Volume': data['v'],
-    }, index=pd.to_datetime(data['t'], unit='s'))
-    df.index.name = 'timestamp'
-    return df.dropna(), None
-
-def get_data_finnhub(symbol, api_key):
-    """
-    Fetch 15 m, 30 m, and 1 h candles for the given symbol.
-    Shows granular error messages so the user knows exactly what went wrong.
-    """
-    if not api_key:
-        st.error("Please enter your Finnhub API key in the sidebar.")
-        return None
-
-    now      = int(datetime.utcnow().timestamp())
-    windows  = {
-        '15m': (now - 5  * 86400, '15'),   # 5 days
-        '30m': (now - 7  * 86400, '30'),   # 7 days
-        '1h':  (now - 14 * 86400, '60'),   # 14 days
-    }
-
-    data   = {}
-    errors = {}
-
-    for tf, (from_ts, res) in windows.items():
-        df, err = get_finnhub_candles(symbol, res, from_ts, now, api_key)
-        if err:
-            errors[tf] = err
-        elif df is None or len(df) < 10:
-            errors[tf] = f"Too few candles returned ({0 if df is None else len(df)})"
-        else:
-            data[tf] = df
-
-    if errors:
-        st.error("**Finnhub data errors:**")
-        for tf, msg in errors.items():
-            st.error(f"• `{tf}`: {msg}")
-        if not data:
-            st.info("""
-**Common fixes:**
-- **Crypto:** Use `BINANCE:BTCUSDT`, `BINANCE:ETHUSDT`, `BINANCE:XRPUSDT`
-- **Gold / Silver:** Use `OANDA:XAU_USD` or `OANDA:XAG_USD`
-- **Forex:** Use `OANDA:EUR_USD`, `OANDA:GBP_USD`
-- **Stocks:** Just the ticker, e.g. `AAPL`, `TSLA`
-- The free Finnhub plan supports crypto candles and basic forex candles.
-            """)
+        if raw_15m.empty or raw_1h.empty:
             return None
-        # partial data — still try to render
-        st.warning(f"Partial data: missing {list(errors.keys())}. Results may be limited.")
 
-    if len(data) < 2:
+        data = {
+            "15m": raw_15m,
+            "30m": raw_15m.resample("30min").agg(
+                Open="first", High="max", Low="min", Close="last", Volume="sum"
+            ).dropna(),
+            "1h":  raw_1h,
+            "1d":  raw_1d,
+        }
+        return data
+    except Exception as e:
+        st.error(f"Download error for {symbol}: {e}")
         return None
-    return data
 
-# --- LIVE PRICE FEED ---
-def get_live_quote_finnhub(symbol, sym_type, api_key):
-    """
-    Return {price, change} for any asset type.
-    Stocks   → /quote
-    Crypto   → /crypto/candle D (last two daily bars give % change)
-    Forex    → /forex/candle  D
-    """
-    if sym_type == 'stock':
-        url = 'https://finnhub.io/api/v1/quote'
-        d, _ = _finnhub_get(url, {'symbol': symbol, 'token': api_key})
-        if d and d.get('c'):
-            price = d['c']
-            prev  = d.get('pc', price)
-            chg   = ((price - prev) / prev * 100) if prev else 0
-            return {'price': price, 'change': chg}
-
-    else:  # crypto or forex
-        cand_url = _candle_url(sym_type)
-        now  = int(datetime.utcnow().timestamp())
-        from_ts = now - 3 * 86400
-        d, _ = _finnhub_get(cand_url, {
-            'symbol': symbol, 'resolution': 'D',
-            'from': from_ts, 'to': now, 'token': api_key
-        })
-        if d and d.get('s') == 'ok' and len(d.get('c', [])) >= 2:
-            price = d['c'][-1]
-            prev  = d['c'][-2]
-            chg   = ((price - prev) / prev * 100) if prev else 0
-            return {'price': price, 'change': chg}
-
-    return {'price': 0, 'change': 0}
 
 @st.cache_data(ttl=60)
-def get_live_prices(api_key):
-    """Fetch ticker prices for the five headline assets."""
-    prices = {}
-    for name, meta in TICKER_SYMBOLS.items():
-        q = get_live_quote_finnhub(meta['finnhub'], meta['type'], api_key)
-        prices[name] = {**q, 'symbol': meta['finnhub']}
-    return prices
+def fetch_ticker_row() -> dict:
+    """Live quote for the five headline assets."""
+    result = {}
+    for name, sym in TICKER_ROW.items():
+        try:
+            t = yf.Ticker(sym)
+            h = t.history(period="2d", interval="1d")
+            if len(h) >= 2:
+                price = float(h["Close"].iloc[-1])
+                prev  = float(h["Close"].iloc[-2])
+                chg   = (price - prev) / prev * 100
+            else:
+                price, chg = 0.0, 0.0
+            result[name] = {"price": price, "change": chg}
+        except:
+            result[name] = {"price": 0.0, "change": 0.0}
+    return result
 
-# --- SIMPLIFIED TECHNICAL INDICATORS (EMA 100 & 200 ONLY) ---
-def add_indicators(df):
-    """Add ONLY EMA 100 and EMA 200 plus essential indicators"""
-    if len(df) < 200:
+
+# ── Indicators (EMA 100 + EMA 200 only for trend, plus RSI/MACD/ATR/ADX/BB/Volume) ──
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    n = len(df)
+    if n < 30:
         return df
-    
-    # ONLY these two EMAs
-    df['EMA100'] = df['Close'].ewm(span=100, adjust=False).mean()
-    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    # RSI (keep for momentum)
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-9)
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    # MACD (keep for crossovers)
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['Signal']
-    
-    # ATR (for stop loss)
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    df['ATR'] = true_range.rolling(14).mean()
-    
-    # ADX (trend strength)
-    plus_dm = df['High'].diff()
-    minus_dm = -df['Low'].diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-    
-    tr = pd.concat([df['High'] - df['Low'], 
-                    abs(df['High'] - df['Close'].shift()), 
-                    abs(df['Low'] - df['Close'].shift())], axis=1).max(axis=1)
-    
-    atr = tr.rolling(window=14).mean()
-    plus_di = 100 * (plus_dm.rolling(window=14).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window=14).mean() / atr)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(window=14).mean()
-    
-    # Volume
-    df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-    df['Volume_Ratio'] = df['Volume'] / (df['Volume_MA'] + 1e-9)
-    
+
+    # ── THE ONLY TWO EMAs ──
+    df["EMA100"] = df["Close"].ewm(span=100, adjust=False).mean()
+    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
+
+    # RSI
+    delta = df["Close"].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    df["RSI"] = 100 - 100 / (1 + gain / (loss + 1e-9))
+
+    # MACD
+    e12 = df["Close"].ewm(span=12, adjust=False).mean()
+    e26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"]      = e12 - e26
+    df["MACD_Sig"]  = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"] = df["MACD"] - df["MACD_Sig"]
+
+    # ATR
+    hl  = df["High"] - df["Low"]
+    hcp = (df["High"] - df["Close"].shift()).abs()
+    lcp = (df["Low"]  - df["Close"].shift()).abs()
+    df["ATR"] = pd.concat([hl, hcp, lcp], axis=1).max(axis=1).rolling(14).mean()
+
+    # ADX
+    pdm = df["High"].diff().clip(lower=0)
+    ndm = (-df["Low"].diff()).clip(lower=0)
+    atr14 = df["ATR"]
+    pdi = 100 * pdm.rolling(14).mean() / (atr14 + 1e-9)
+    ndi = 100 * ndm.rolling(14).mean() / (atr14 + 1e-9)
+    dx  = 100 * (pdi - ndi).abs() / (pdi + ndi + 1e-9)
+    df["ADX"] = dx.rolling(14).mean()
+
     # Bollinger Bands
-    df['BB_Middle'] = df['Close'].rolling(window=20).mean()
-    df['BB_Std'] = df['Close'].rolling(window=20).std()
-    df['BB_Upper'] = df['BB_Middle'] + (df['BB_Std'] * 2)
-    df['BB_Lower'] = df['BB_Middle'] - (df['BB_Std'] * 2)
-    
+    df["BB_mid"] = df["Close"].rolling(20).mean()
+    bb_std = df["Close"].rolling(20).std()
+    df["BB_up"]  = df["BB_mid"] + 2 * bb_std
+    df["BB_lo"]  = df["BB_mid"] - 2 * bb_std
+
+    # Volume ratio
+    df["Vol_MA"]  = df["Volume"].rolling(20).mean()
+    df["Vol_Rat"] = df["Volume"] / (df["Vol_MA"] + 1e-9)
+
+    # Stochastic
+    lo14 = df["Low"].rolling(14).min()
+    hi14 = df["High"].rolling(14).max()
+    df["Stoch_K"] = 100 * (df["Close"] - lo14) / (hi14 - lo14 + 1e-9)
+    df["Stoch_D"] = df["Stoch_K"].rolling(3).mean()
+
     return df
 
-# --- SIMPLIFIED SIGNAL GENERATION (EMA 100/200 FOCUSED) ---
-def generate_signal_simplified(df, timeframe_name):
-    """
-    Simplified signal based ONLY on EMA 100/200 relationship
-    Plus RSI, MACD, and ADX for confirmation
-    """
-    if len(df) < 200:
+
+# ── Candle pattern ────────────────────────────────────────────
+def candle_pattern(df: pd.DataFrame) -> str:
+    if len(df) < 3:
+        return "—"
+    r, p, p2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    body  = abs(r.Open - r.Close)
+    hi_w  = r.High - max(r.Open, r.Close)
+    lo_w  = min(r.Open, r.Close) - r.Low
+    rng   = r.High - r.Low + 1e-9
+    p_body = abs(p.Open - p.Close)
+
+    if body < rng * 0.1:                                          return "➕ Doji"
+    if lo_w > body * 2 and hi_w < body * 0.5:                    return "🔨 Hammer"
+    if hi_w > body * 2 and lo_w < body * 0.5:                    return "🌠 Shooting Star"
+    if (r.Close > r.Open and p.Close < p.Open
+            and r.Open <= p.Close and r.Close >= p.Open):         return "🟢 Bull Engulf"
+    if (r.Close < r.Open and p.Close > p.Open
+            and r.Open >= p.Close and r.Close <= p.Open):         return "🔴 Bear Engulf"
+    if (p2.Close < p2.Open and p_body < abs(p2.Open-p2.Close)*0.3
+            and r.Close > r.Open
+            and r.Close > (p2.Open+p2.Close)/2):                  return "⭐ Morning Star"
+    if (p2.Close > p2.Open and p_body < abs(p2.Open-p2.Close)*0.3
+            and r.Close < r.Open
+            and r.Close < (p2.Open+p2.Close)/2):                  return "🌙 Evening Star"
+    return "• Normal"
+
+
+# ── Simplified signal (EMA 100/200 centred) ──────────────────
+def ema_signal(df: pd.DataFrame) -> dict | None:
+    if len(df) < 205:
         return None
-    
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    
+    c = df.iloc[-1]
+    p = df.iloc[-2]
     score = 0
-    max_score = 0
-    signals = []
-    
-    # 1. PRICE vs EMA 200 (Most important - 40 points)
-    max_score += 40
-    if curr['Close'] > curr['EMA200']:
-        score += 40
-        signals.append("✅ Price above 200 EMA (Major Uptrend)")
+
+    # EMA 200 position (40 pts)
+    if c.Close > c.EMA200:  score += 40
+    else:                   score -= 40
+
+    # EMA 100 position (30 pts)
+    if c.Close > c.EMA100:  score += 30
+    else:                   score -= 30
+
+    # EMA alignment (20 pts)
+    if c.EMA100 > c.EMA200: score += 20
+    else:                   score -= 20
+
+    # RSI (10 pts)
+    if 40 <= c.RSI <= 60:   score += 10
+    elif c.RSI > 70:        score -= 5
+    elif c.RSI < 30:        score += 5
+
+    norm = (score + 100) / 200 * 100   # 0‥100
+
+    if   norm >= 75: sig = "🟢 STRONG BUY"
+    elif norm >= 60: sig = "🟢 BUY"
+    elif norm >= 45: sig = "🟡 NEUTRAL"
+    elif norm >= 30: sig = "🔴 SELL"
+    else:            sig = "🔴 STRONG SELL"
+
+    return dict(
+        Signal=sig, Score=round(norm, 1),
+        RSI=round(c.RSI, 1), ADX=round(c.ADX, 1),
+        ATR=c.ATR, Price=c.Close,
+        EMA100=c.EMA100, EMA200=c.EMA200,
+        MACD=c.MACD, MACD_Sig=c.MACD_Sig,
+    )
+
+
+# ── Conflict detection ────────────────────────────────────────
+def detect_conflicts(data: dict, sigs: dict) -> dict:
+    df5  = add_indicators(data["15m"])
+    df1h = add_indicators(data["1h"])
+
+    p = df5["Close"]
+    mom_15m = (p.iloc[-1] - p.iloc[-2]) / p.iloc[-2] * 100 if len(p) > 1 else 0
+    mom_1h  = (df1h["Close"].iloc[-1] - df1h["Close"].iloc[-3]) / df1h["Close"].iloc[-3] * 100 if len(df1h) > 3 else 0
+
+    conflicts, warnings = [], []
+    risk = 0
+    sig = sigs.get("15m", {})
+
+    # Price vs signal divergence
+    if sig and "BUY" in sig.get("Signal", ""):
+        if mom_15m < -0.4:
+            conflicts.append({"msg": f"⚡ BUY signal but price fell {mom_15m:.2f}% in last 15 min", "sev": "CRIT"})
+            risk += 30
+        if mom_1h < -1.0:
+            conflicts.append({"msg": f"🚨 BUY signal but –{abs(mom_1h):.2f}% on 1h momentum", "sev": "CRIT"})
+            risk += 25
+    if sig and "SELL" in sig.get("Signal", ""):
+        if mom_15m > 0.4:
+            conflicts.append({"msg": f"⚡ SELL signal but price rose +{mom_15m:.2f}% in last 15 min", "sev": "CRIT"})
+            risk += 25
+
+    # TF disagreement
+    s15 = sigs.get("15m", {}).get("Signal", "")
+    s1h = sigs.get("1h",  {}).get("Signal", "")
+    if "BUY" in s15 and "SELL" in s1h:
+        conflicts.append({"msg": "⚠️ 15m BUY vs 1h SELL — counter-trend scalp", "sev": "HIGH"})
+        risk += 15
+
+    # Overbought on BUY
+    if sig and "BUY" in sig.get("Signal", "") and sig.get("RSI", 50) > 72:
+        warnings.append({"msg": f"RSI overbought ({sig['RSI']:.0f}) on a BUY — late entry risk"})
+        risk += 8
+
+    # Oversold on SELL
+    if sig and "SELL" in sig.get("Signal", "") and sig.get("RSI", 50) < 28:
+        warnings.append({"msg": f"RSI oversold ({sig['RSI']:.0f}) on a SELL — bounce risk"})
+        risk += 8
+
+    # Weak ADX
+    if sig and sig.get("ADX", 30) < 18 and ("STRONG" in sig.get("Signal", "")):
+        warnings.append({"msg": f"ADX {sig.get('ADX', 0):.1f} — trend is weak, signal may be noise"})
+        risk += 6
+
+    # Low volume
+    last_vol = df5["Vol_Rat"].iloc[-1] if "Vol_Rat" in df5 else 1
+    if last_vol < 0.5:
+        warnings.append({"msg": f"Volume only {last_vol:.1f}× average — low conviction"})
+        risk += 5
+
+    if risk >= 30:   assessment, col = "🚫 HIGH RISK — avoid", "red"
+    elif risk >= 15: assessment, col = "⚠️ MEDIUM RISK — reduce size", "orange"
+    elif risk > 0:   assessment, col = "💛 LOW RISK — trade with care", "yellow"
+    else:            assessment, col = "✅ CLEAN — signals aligned", "green"
+
+    return dict(conflicts=conflicts, warnings=warnings,
+                risk=risk, assessment=assessment, color=col,
+                mom_15m=mom_15m, mom_1h=mom_1h)
+
+
+# ── Master signal ─────────────────────────────────────────────
+def master_signal(data: dict) -> dict:
+    df15 = add_indicators(data["15m"])
+    df30 = add_indicators(data["30m"])
+    df1h = add_indicators(data["1h"])
+
+    if len(df15) < 205 or len(df1h) < 205:
+        return {"scalp": None, "intra": None}
+
+    c15, c30, c1h = df15.iloc[-1], df30.iloc[-1], df1h.iloc[-1]
+
+    # ── SCALPING (15m only, EMA 100/200) ──────────────────────
+    sc, sr = 0, []
+    if c15.Close > c15.EMA200 and c15.Close > c15.EMA100:
+        sc += 35; sr.append("✅ Above both EMAs (strong bull zone)")
+    elif c15.Close > c15.EMA200:
+        sc += 18; sr.append("⚠️ Above EMA200 but below EMA100")
     else:
-        score -= 40
-        signals.append("⛔ Price below 200 EMA (Major Downtrend)")
-    
-    # 2. PRICE vs EMA 100 (Important - 30 points)
-    max_score += 30
-    if curr['Close'] > curr['EMA100']:
-        score += 30
-        signals.append("✅ Price above 100 EMA (Short-term Uptrend)")
+        sr.append("❌ Below EMA200 (bearish zone)")
+    if c15.EMA100 > c15.EMA200:
+        sc += 25; sr.append("✅ EMA100 > EMA200 — bullish crossover")
     else:
-        score -= 30
-        signals.append("⛔ Price below 100 EMA (Short-term Downtrend)")
-    
-    # 3. EMA ALIGNMENT (20 points)
-    max_score += 20
-    if curr['EMA100'] > curr['EMA200']:
-        score += 20
-        signals.append("✅ EMA 100 above EMA 200 (Bullish Alignment)")
+        sr.append("❌ EMA100 < EMA200 — bearish alignment")
+    if 42 <= c15.RSI <= 62:
+        sc += 20; sr.append(f"✅ RSI neutral {c15.RSI:.0f} — room to run")
+    elif c15.RSI > 72:
+        sr.append(f"⚠️ RSI overbought {c15.RSI:.0f}")
+    elif c15.RSI < 28:
+        sc += 10; sr.append(f"💎 RSI oversold {c15.RSI:.0f}")
+    if c15.Vol_Rat > 1.3:
+        sc += 10; sr.append(f"✅ Volume {c15.Vol_Rat:.1f}× — conviction present")
+    if c15.MACD > c15.MACD_Sig:
+        sc += 10; sr.append("✅ MACD bullish crossover on 15m")
     else:
-        score -= 20
-        signals.append("⛔ EMA 100 below EMA 200 (Bearish Alignment)")
-    
-    # 4. RSI (10 points)
-    max_score += 10
-    if 40 <= curr['RSI'] <= 60:
-        score += 10
-        signals.append(f"✅ RSI neutral ({curr['RSI']:.1f})")
-    elif curr['RSI'] > 70:
-        score -= 5
-        signals.append(f"⚠️ RSI Overbought ({curr['RSI']:.1f})")
-    elif curr['RSI'] < 30:
-        score += 5
-        signals.append(f"💎 RSI Oversold ({curr['RSI']:.1f})")
-    
-    # Calculate normalized score
-    normalized_score = ((score + max_score) / (2 * max_score)) * 100
-    
-    # Determine signal
-    if normalized_score >= 75:
-        signal_type = "🟢 STRONG BUY"
-    elif normalized_score >= 60:
-        signal_type = "🟢 BUY"
-    elif normalized_score >= 45:
-        signal_type = "🟡 NEUTRAL"
-    elif normalized_score >= 30:
-        signal_type = "🔴 SELL"
+        sr.append("⚠️ MACD below signal on 15m")
+
+    # ── INTRADAY (30m + 1h, EMA 100/200 aligned) ─────────────
+    ic, ir = 0, []
+    # 30m leg
+    if c30.Close > c30.EMA200:
+        ic += 20; ir.append("✅ 30m above EMA200")
     else:
-        signal_type = "🔴 STRONG SELL"
-    
+        ir.append("❌ 30m below EMA200")
+    if c30.EMA100 > c30.EMA200:
+        ic += 15; ir.append("✅ 30m EMA100>EMA200 bullish stack")
+    # 1h leg (heavier weight)
+    if c1h.Close > c1h.EMA200 and c1h.EMA100 > c1h.EMA200:
+        ic += 35; ir.append("✅ 1h perfect EMA alignment")
+    elif c1h.Close > c1h.EMA200:
+        ic += 20; ir.append("⚠️ 1h above EMA200 but EMA100 not crossed")
+    else:
+        ir.append("❌ 1h below EMA200 — bearish trend")
+    if c1h.ADX > 25:
+        ic += 20; ir.append(f"✅ ADX {c1h.ADX:.0f} — strong trend")
+    elif c1h.ADX > 18:
+        ic += 10; ir.append(f"⚠️ ADX {c1h.ADX:.0f} — moderate trend")
+    else:
+        ir.append(f"❌ ADX {c1h.ADX:.0f} — choppy, no clear trend")
+    if c1h.MACD > c1h.MACD_Sig:
+        ic += 10; ir.append("✅ 1h MACD bullish")
+
+    def _grade(s):
+        if s >= 80: return "STRONG BUY",   "sig-strong-buy",  "🚀"
+        if s >= 62: return "BUY",           "sig-buy",         "📈"
+        if s >= 42: return "NEUTRAL",       "sig-neutral",     "⏸️"
+        if s >= 25: return "SELL",          "sig-sell",        "📉"
+        return           "STRONG SELL",     "sig-strong-sell", "🔻"
+
+    scalp_sig, scalp_cls, scalp_ico = _grade(sc)
+    intra_sig, intra_cls, intra_ico = _grade(ic)
+
     return {
-        "Signal": signal_type,
-        "Score": round(normalized_score, 1),
-        "RSI": round(curr['RSI'], 1),
-        "MACD": round(curr['MACD'], 4),
-        "ADX": round(curr['ADX'], 1),
-        "ATR": curr['ATR'],
-        "Price": curr['Close'],
-        "EMA100": curr['EMA100'],
-        "EMA200": curr['EMA200'],
-        "Signals": signals
+        "scalp":  dict(signal=scalp_sig, cls=scalp_cls, icon=scalp_ico, score=sc,  reasons=sr),
+        "intra":  dict(signal=intra_sig, cls=intra_cls, icon=intra_ico, score=ic, reasons=ir),
     }
 
-# --- TRADE CALCULATOR ---
-def calculate_trade(price, atr, mode="LONG", style="Scalp", risk_reward=1.5):
-    """Calculate entry, stop loss, and take profit"""
-    multiplier = 1.5 if style == "Scalp" else 2.0
-    sl_dist = atr * multiplier
-    
-    if mode == "LONG":
-        sl = price - sl_dist
-        tp = price + (sl_dist * risk_reward)
-    else:
-        sl = price + sl_dist
-        tp = price - (sl_dist * risk_reward)
-    
-    risk_pct = (sl_dist / price) * 100
-    reward_pct = abs((tp - price) / price) * 100
-    
-    return {
-        'entry': price,
-        'sl': sl,
-        'tp': tp,
-        'risk_pct': abs(risk_pct),
-        'reward_pct': abs(reward_pct),
-        'rr_ratio': risk_reward
-    }
 
-# --- MASTER SIGNAL (SIMPLIFIED FOR 15m, 30m, 1h) ---
-def calculate_master_signal_simplified(data_sets, api_key):
-    """
-    Simplified master signals:
-    - SCALPING: 15m only
-    - INTRADAY: 30m + 1h alignment
-    """
-    
-    master_signals = {
-        'scalping': {'signal': 'NEUTRAL', 'score': 0, 'reasons': []},
-        'intraday': {'signal': 'NEUTRAL', 'score': 0, 'reasons': []}
-    }
-    
-    # Get data
-    df_15m = add_indicators(data_sets['15m'])
-    df_30m = add_indicators(data_sets['30m'])
-    df_1h = add_indicators(data_sets['1h'])
-    
-    curr_15m = df_15m.iloc[-1]
-    curr_30m = df_30m.iloc[-1]
-    curr_1h = df_1h.iloc[-1]
-    
-    # ============ SCALPING (15m) ============
-    scalp_score = 0
-    scalp_reasons = []
-    
-    # EMA 100/200 position (60 points)
-    if curr_15m['Close'] > curr_15m['EMA200'] and curr_15m['Close'] > curr_15m['EMA100']:
-        scalp_score += 60
-        scalp_reasons.append("✅ Above both EMAs - Strong bullish")
-    elif curr_15m['Close'] < curr_15m['EMA200'] and curr_15m['Close'] < curr_15m['EMA100']:
-        scalp_score += 0
-        scalp_reasons.append("❌ Below both EMAs - Strong bearish")
-    else:
-        scalp_score += 30
-        scalp_reasons.append("⚠️ Between EMAs - Mixed")
-    
-    # EMA alignment (20 points)
-    if curr_15m['EMA100'] > curr_15m['EMA200']:
-        scalp_score += 20
-        scalp_reasons.append("✅ EMA 100 > EMA 200")
-    
-    # RSI (20 points)
-    if 45 <= curr_15m['RSI'] <= 65:
-        scalp_score += 20
-        scalp_reasons.append(f"✅ RSI optimal ({curr_15m['RSI']:.1f})")
-    elif curr_15m['RSI'] > 75 or curr_15m['RSI'] < 25:
-        scalp_reasons.append(f"⚠️ RSI extreme ({curr_15m['RSI']:.1f})")
-    
-    # Determine scalping signal
-    if scalp_score >= 75:
-        master_signals['scalping']['signal'] = "STRONG BUY"
-    elif scalp_score >= 60:
-        master_signals['scalping']['signal'] = "BUY"
-    elif scalp_score <= 35:
-        master_signals['scalping']['signal'] = "SELL"
-    else:
-        master_signals['scalping']['signal'] = "NEUTRAL"
-    
-    master_signals['scalping']['score'] = scalp_score
-    master_signals['scalping']['reasons'] = scalp_reasons
-    
-    # ============ INTRADAY (30m + 1h) ============
-    intra_score = 0
-    intra_reasons = []
-    
-    # 30m EMA position (30 points)
-    if curr_30m['Close'] > curr_30m['EMA200']:
-        intra_score += 30
-        intra_reasons.append("✅ 30m: Above EMA 200")
-    else:
-        intra_reasons.append("⛔ 30m: Below EMA 200")
-    
-    # 1h EMA position (40 points - most important)
-    if curr_1h['Close'] > curr_1h['EMA200'] and curr_1h['EMA100'] > curr_1h['EMA200']:
-        intra_score += 40
-        intra_reasons.append("✅ 1h: Perfect EMA alignment")
-    elif curr_1h['Close'] > curr_1h['EMA200']:
-        intra_score += 25
-        intra_reasons.append("✅ 1h: Above EMA 200")
-    else:
-        intra_reasons.append("⛔ 1h: Below EMA 200")
-    
-    # ADX (30 points - trend strength)
-    if curr_1h['ADX'] > 25:
-        intra_score += 30
-        intra_reasons.append(f"✅ Strong trend (ADX: {curr_1h['ADX']:.1f})")
-    else:
-        intra_reasons.append(f"⚠️ Weak trend (ADX: {curr_1h['ADX']:.1f})")
-    
-    # Determine intraday signal
-    if intra_score >= 75:
-        master_signals['intraday']['signal'] = "STRONG BUY"
-    elif intra_score >= 60:
-        master_signals['intraday']['signal'] = "BUY"
-    elif intra_score <= 35:
-        master_signals['intraday']['signal'] = "SELL"
-    else:
-        master_signals['intraday']['signal'] = "NEUTRAL"
-    
-    master_signals['intraday']['score'] = intra_score
-    master_signals['intraday']['reasons'] = intra_reasons
-    
-    return master_signals
+# ── Prediction engine ─────────────────────────────────────────
+def predict(df: pd.DataFrame, tf: str) -> dict | None:
+    if len(df) < 60:
+        return None
+    price = float(df["Close"].iloc[-1])
+    atr   = float(df["ATR"].iloc[-1]) if "ATR" in df else price * 0.01
 
-# ============================================
-# SIDEBAR
-# ============================================
+    # Weighted linear regression (recent data counts more)
+    recent = df["Close"].tail(30).values
+    x = np.arange(len(recent))
+    w = np.exp(x / len(recent))
+    wx = np.average(x, weights=w); wy = np.average(recent, weights=w)
+    denom = np.sum(w * (x - wx) ** 2)
+    slope = np.sum(w * (x - wx) * (recent - wy)) / (denom + 1e-9)
+    intercept = wy - slope * wx
+    pred_lr = slope * len(recent) + intercept
 
-st.sidebar.header("⚙️ Settings")
+    # EMA momentum
+    ema_mom = df["EMA100"].iloc[-1] - df["EMA200"].iloc[-1] if "EMA100" in df else 0
+    pred_ema = price + ema_mom * 0.4
 
-# Finnhub API Key
-api_key = st.sidebar.text_input(
-    "Finnhub API Key",
-    value=st.session_state.finnhub_api_key,
-    type="password",
-    help="Get free API key at https://finnhub.io"
-)
-if api_key:
-    st.session_state.finnhub_api_key = api_key
+    # Mean reversion
+    if "BB_lo" in df:
+        if price < df["BB_lo"].iloc[-1]:   pred_bb = df["BB_mid"].iloc[-1]
+        elif price > df["BB_up"].iloc[-1]: pred_bb = df["BB_mid"].iloc[-1]
+        else:                              pred_bb = price
+    else:
+        pred_bb = price
 
-st.sidebar.caption("📝 [Get Free Finnhub API Key](https://finnhub.io)")
+    ensemble = np.mean([pred_lr, pred_ema, pred_bb])
+    move_pct  = (ensemble - price) / price * 100
+
+    return dict(
+        current=price,
+        predicted=ensemble,
+        move_pct=move_pct,
+        upper=price + atr * 1.5,
+        lower=price - atr * 1.5,
+        direction="📈 UP" if move_pct > 0 else "📉 DOWN",
+        strength="Strong" if abs(move_pct) > 1 else "Moderate" if abs(move_pct) > 0.3 else "Weak",
+    )
+
+
+# ── Trade calculator ──────────────────────────────────────────
+def trade_setup(price, atr, direction="LONG", style="Scalp", rr=1.5):
+    m   = 1.5 if style == "Scalp" else 2.0
+    sl  = atr * m
+    if direction == "LONG":
+        return dict(entry=price, sl=price-sl, tp=price+sl*rr,
+                    risk_pct=sl/price*100, reward_pct=sl*rr/price*100)
+    return dict(entry=price, sl=price+sl, tp=price-sl*rr,
+                risk_pct=sl/price*100, reward_pct=sl*rr/price*100)
+
+
+# ── Back-tester ───────────────────────────────────────────────
+def run_backtest(df: pd.DataFrame, periods_ahead=1) -> dict | None:
+    df = df.copy()
+    df = add_indicators(df)
+    if len(df) < 210:
+        return None
+
+    n_test    = min(150, len(df) - 210)
+    correct   = 0
+    in_range  = 0
+    errors    = []
+    preds_arr = []
+    acts_arr  = []
+
+    for i in range(210, 210 + n_test):
+        hist = df.iloc[:i]
+        p    = predict(hist, "bt")
+        if p is None:
+            continue
+        actual = float(df["Close"].iloc[i + periods_ahead - 1])
+        pred_dir  = 1 if p["predicted"] > p["current"] else -1
+        act_dir   = 1 if actual > p["current"] else -1
+        if pred_dir == act_dir:
+            correct += 1
+        if p["lower"] <= actual <= p["upper"]:
+            in_range += 1
+        err = abs(actual - p["predicted"]) / actual * 100
+        errors.append(err)
+        preds_arr.append(p["predicted"])
+        acts_arr.append(actual)
+
+    total = len(errors)
+    if total == 0:
+        return None
+
+    dir_acc   = correct  / total * 100
+    range_acc = in_range / total * 100
+    mape      = np.mean(errors)
+    recent_n  = min(20, total)
+    recent_ok = sum(
+        1 for i in range(-recent_n, 0)
+        if (preds_arr[i] > float(df["Close"].iloc[210 + total + i - 1]))
+        == (acts_arr[i]  > float(df["Close"].iloc[210 + total + i - 1]))
+    )
+    recent_acc = recent_ok / recent_n * 100
+
+    grade = ("🏆 Excellent" if dir_acc >= 70
+             else "✅ Good"    if dir_acc >= 60
+             else "⚠️ Fair"   if dir_acc >= 50
+             else "❌ Poor")
+
+    return dict(
+        dir_acc=dir_acc, range_acc=range_acc,
+        mape=mape, recent_acc=recent_acc,
+        total=total, grade=grade,
+        preds=preds_arr[-50:], acts=acts_arr[-50:],
+    )
+
+
+# ── News feed ─────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def get_news() -> list:
+    if not _FEED:
+        return [{"title": "Install feedparser for live news: pip install feedparser", "link": "#", "time": ""}]
+    items = []
+    for url in ["https://cointelegraph.com/rss", "https://cryptonews.com/news/feed/"]:
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:4]:
+                items.append({"title": e.title, "link": e.link, "time": e.get("published", "")})
+        except:
+            pass
+    return items[:10] or [{"title": "News unavailable", "link": "#", "time": ""}]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ═══════════════════════════════════════════════════════════════
+st.sidebar.markdown("## ⚙️ Dashboard Settings")
+
+view = st.sidebar.radio("View Mode", ["Single Asset", "Multi-Asset"], index=0 if st.session_state.view == "Single Asset" else 1)
+st.session_state.view = view
+
 st.sidebar.divider()
 
-# View mode
-view_mode = st.sidebar.radio(
-    "📊 View Mode",
-    ["Single Asset", "Multi-Asset Comparison"],
-    index=0 if st.session_state.view_mode == "Single Asset" else 1
-)
-st.session_state.view_mode = view_mode
-
-st.sidebar.divider()
-
-# Asset selection
-if view_mode == "Single Asset":
-    symbol = st.sidebar.text_input(
-        "Asset Symbol (Finnhub format)",
-        value=st.session_state.current_symbol,
-        help="Examples: BINANCE:BTCUSDT, OANDA:XAU_USD"
-    ).upper()
-    if symbol:
-        st.session_state.current_symbol = symbol
+if view == "Single Asset":
+    sym_in = st.sidebar.text_input("Symbol", value=st.session_state.symbol, help="e.g. BTC-USD, GC=F, AAPL, EURUSD=X")
+    if sym_in.upper() != st.session_state.symbol:
+        st.session_state.symbol = sym_in.upper()
+        st.cache_data.clear()
+        st.rerun()
 else:
-    symbol_1 = st.sidebar.text_input(
-        "Asset 1",
-        value=st.session_state.symbol_1
-    ).upper()
-    symbol_2 = st.sidebar.text_input(
-        "Asset 2",
-        value=st.session_state.symbol_2
-    ).upper()
-    if symbol_1:
-        st.session_state.symbol_1 = symbol_1
-    if symbol_2:
-        st.session_state.symbol_2 = symbol_2
+    s1 = st.sidebar.text_input("Symbol 1", value=st.session_state.sym1)
+    s2 = st.sidebar.text_input("Symbol 2", value=st.session_state.sym2)
+    if s1.upper() != st.session_state.sym1:
+        st.session_state.sym1 = s1.upper(); st.cache_data.clear(); st.rerun()
+    if s2.upper() != st.session_state.sym2:
+        st.session_state.sym2 = s2.upper(); st.cache_data.clear(); st.rerun()
+
+st.sidebar.markdown("**⚡ Quick Select**")
+qcols = st.sidebar.columns(2)
+for i, (label, ticker) in enumerate(QUICK.items()):
+    with qcols[i % 2]:
+        if st.button(label, key=f"q_{ticker}", use_container_width=True):
+            if view == "Single Asset":
+                st.session_state.symbol = ticker
+            else:
+                st.session_state.sym1 = ticker
+            st.cache_data.clear()
+            st.rerun()
 
 st.sidebar.divider()
 
-# Manual refresh
-if st.sidebar.button("🔄 REFRESH NOW", use_container_width=True):
-    st.session_state.last_refresh = datetime.now()
+if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
+    st.cache_data.clear()
+    st.session_state.refreshed_at = datetime.now()
     st.rerun()
 
-st.session_state.auto_refresh = st.sidebar.checkbox("Auto-Refresh (60s)", value=st.session_state.auto_refresh)
+st.session_state.auto = st.sidebar.checkbox("Auto-refresh (60 s)", value=st.session_state.auto)
+
+if st.sidebar.checkbox("📊 Show Backtest"):
+    st.session_state.show_bt = True
+else:
+    st.session_state.show_bt = False
 
 st.sidebar.divider()
+st.sidebar.markdown("**Risk Settings**")
+rr_ratio = st.sidebar.slider("Risk : Reward", 1.0, 3.0, 1.5, 0.5)
+pos_size = st.sidebar.number_input("Position Size ($)", 100, 1_000_000, 1000, 100)
+st.sidebar.caption(f"Refreshed: {st.session_state.refreshed_at.strftime('%H:%M:%S')}")
 
-# Quick select
-st.sidebar.subheader("⚡ Quick Select")
-quick_assets = {
-    'BTC': 'BINANCE:BTCUSDT',
-    'ETH': 'BINANCE:ETHUSDT',
-    'Gold': 'OANDA:XAU_USD',
-    'Silver': 'OANDA:XAG_USD',
-    'EUR/USD': 'OANDA:EUR_USD',
-    'XRP': 'BINANCE:XRPUSDT'
-}
+# ── Supported symbols helper ───────────────────────────────────
+with st.sidebar.expander("📖 Symbol Guide"):
+    st.markdown("""
+| Asset | Symbol |
+|---|---|
+| Bitcoin | `BTC-USD` |
+| Ethereum | `ETH-USD` |
+| XRP | `XRP-USD` |
+| Gold | `GC=F` |
+| Silver | `SI=F` |
+| Oil (WTI) | `CL=F` |
+| EUR/USD | `EURUSD=X` |
+| DXY | `DX-Y.NYB` |
+| S&P 500 | `^GSPC` |
+| Any stock | `AAPL`, `TSLA` … |
+""")
 
-cols = st.sidebar.columns(2)
-for idx, (name, ticker) in enumerate(quick_assets.items()):
-    with cols[idx % 2]:
-        if st.button(name, use_container_width=True, key=f"quick_{ticker}"):
-            if view_mode == "Single Asset":
-                st.session_state.current_symbol = ticker
-                st.rerun()
+
+# ═══════════════════════════════════════════════════════════════
+#  RENDER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+
+def render_ticker_row():
+    prices = fetch_ticker_row()
+    cols   = st.columns(5)
+    for i, (name, d) in enumerate(prices.items()):
+        chg, price = d["change"], d["price"]
+        color = "up" if chg >= 0 else "down"
+        arrow = "▲" if chg >= 0 else "▼"
+        pf    = f"${price:,.4f}" if price < 5 else f"${price:,.2f}"
+        with cols[i]:
+            st.markdown(f"""
+            <div class="ticker-card">
+                <div class="ticker-name">{name}</div>
+                <div class="ticker-price">{pf}</div>
+                <div class="ticker-chg {color}">{arrow} {abs(chg):.2f}%</div>
+            </div>""", unsafe_allow_html=True)
+
+
+def render_master_signals(ms: dict):
+    st.subheader("🎯 Master Signals")
+    st.caption("Every indicator, volume, pattern, momentum & conflict factored in — one definitive signal per style")
+    c1, c2 = st.columns(2)
+    for col, key, label, tf_note in [
+        (c1, "scalp", "⚡ SCALPING",   "15m candles"),
+        (c2, "intra", "📅 INTRADAY",   "30m + 1h candles"),
+    ]:
+        sig = ms.get(key)
+        if sig is None:
+            with col:
+                st.info(f"{label} — not enough data (need 200+ candles)")
+            continue
+        with col:
+            st.markdown(f"""
+            <div class="msig {sig['cls']}">
+                <div class="msig-label">{label} &nbsp;·&nbsp; {tf_note}</div>
+                <div class="msig-signal">{sig['icon']} {sig['signal']}</div>
+                <div class="msig-score">Score {sig['score']}/100</div>
+            </div>""", unsafe_allow_html=True)
+            with st.expander("📋 Why this signal?"):
+                for r in sig["reasons"]:
+                    st.write(r)
+
+
+def render_conflict_panel(cf: dict):
+    st.subheader("🔬 Signal Quality Check")
+    c1, c2, c3 = st.columns([3, 1, 1])
+    with c1:
+        badge = ("badge-crit" if cf["color"] == "red"
+                 else "badge-warn" if cf["color"] in ("orange","yellow")
+                 else "badge-ok")
+        st.markdown(f'<div class="{badge}"><b>{cf["assessment"]}</b></div>', unsafe_allow_html=True)
+    with c2:
+        st.metric("Risk Score", cf["risk"], delta="lower=better", delta_color="inverse")
+    with c3:
+        st.metric("15m Momentum", f"{cf['mom_15m']:+.2f}%")
+
+    if cf["conflicts"]:
+        for c in cf["conflicts"]:
+            level = "badge-crit" if c["sev"] == "CRIT" else "badge-warn"
+            st.markdown(f'<div class="{level}">{c["msg"]}</div>', unsafe_allow_html=True)
+    if cf["warnings"]:
+        for w in cf["warnings"]:
+            st.markdown(f'<div class="badge-warn">⚠️ {w["msg"]}</div>', unsafe_allow_html=True)
+    if not cf["conflicts"] and not cf["warnings"]:
+        st.markdown('<div class="badge-ok">✅ No conflicts detected — clean setup</div>', unsafe_allow_html=True)
+
+    with st.expander("📊 Momentum breakdown"):
+        st.write(f"15m momentum: **{cf['mom_15m']:+.2f}%**")
+        st.write(f"1h  momentum: **{cf['mom_1h']:+.2f}%**")
+        st.caption("If signal says BUY but momentum is negative → indicators are lagging. WAIT.")
+
+
+def render_tf_scanner(data: dict) -> dict:
+    st.subheader("⏰ Multi-Timeframe Scanner")
+    tfs   = ["15m", "30m", "1h"]
+    cols  = st.columns(3)
+    sigs  = {}
+    for i, tf in enumerate(tfs):
+        df  = add_indicators(data[tf])
+        sig = ema_signal(df)
+        pat = candle_pattern(df)
+        sigs[tf] = sig
+        with cols[i]:
+            st.markdown(f"**{tf.upper()}**")
+            st.caption(pat)
+            if sig:
+                colour = ("#2a9d8f" if "BUY" in sig["Signal"]
+                          else "#e76f51" if "SELL" in sig["Signal"]
+                          else "#a08c2a")
+                st.markdown(
+                    f'<span style="color:{colour};font-weight:700">{sig["Signal"]}</span>',
+                    unsafe_allow_html=True)
+                st.progress(sig["Score"] / 100)
+                st.caption(f"Score {sig['Score']}/100  ·  RSI {sig['RSI']}  ·  ADX {sig['ADX']}")
             else:
-                st.session_state.symbol_1 = ticker
-                st.rerun()
+                st.caption("Not enough data")
+    return sigs
 
-st.sidebar.divider()
 
-# Risk settings
-st.sidebar.subheader("Risk Management")
-risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.5)
-position_size = st.sidebar.number_input("Position Size ($)", min_value=100, value=1000, step=100)
+def render_trade_setups(sigs: dict, rr: float, pos: int):
+    st.subheader("🎯 AI Trade Setups")
+    c1, c2 = st.columns(2)
 
-st.sidebar.info(f"Last Refresh: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
-
-# ── API Diagnostic ──────────────────────────────────────────
-with st.sidebar.expander("🔎 API Diagnostic"):
-    if st.button("Test API Key", use_container_width=True):
-        if st.session_state.finnhub_api_key:
-            with st.spinner("Testing…"):
-                d, err = _finnhub_get(
-                    'https://finnhub.io/api/v1/crypto/candle',
-                    {
-                        'symbol': 'BINANCE:BTCUSDT',
-                        'resolution': '15',
-                        'from': int(datetime.utcnow().timestamp()) - 86400,
-                        'to':   int(datetime.utcnow().timestamp()),
-                        'token': st.session_state.finnhub_api_key,
-                    }
-                )
-            if err:
-                st.error(f"Test FAILED: {err}")
-            elif d and d.get('s') == 'ok':
-                st.success(f"✅ Key works! Got {len(d['t'])} BTC candles.")
+    pairs = [
+        (c1, "15m", "⚡ Scalping (15m)",  "Scalp"),
+        (c2, "1h",  "📅 Intraday (1h)",   "Intraday"),
+    ]
+    for col, tf, title, style in pairs:
+        sig = sigs.get(tf)
+        with col:
+            st.markdown(f"**{title}**")
+            if sig is None:
+                st.markdown('<div class="trade-none">Not enough data</div>', unsafe_allow_html=True)
+                continue
+            price, atr = sig["Price"], sig["ATR"]
+            if "BUY" in sig["Signal"]:
+                t = trade_setup(price, atr, "LONG", style, rr)
+                risk_amt = pos * t["risk_pct"] / 100
+                st.markdown(f"""
+                <div class="trade-long">
+                    <b>📈 LONG</b><br>
+                    Entry &nbsp; <b>${t['entry']:,.2f}</b><br>
+                    🎯 TP &nbsp;&nbsp; <b>${t['tp']:,.2f}</b> &nbsp;(+{t['reward_pct']:.2f}%)<br>
+                    🛑 SL &nbsp;&nbsp; <b>${t['sl']:,.2f}</b> &nbsp;(-{t['risk_pct']:.2f}%)<br>
+                    💰 Risk &nbsp; <b>${risk_amt:.2f}</b> → Reward <b>${risk_amt*rr:.2f}</b>
+                </div>""", unsafe_allow_html=True)
+            elif "SELL" in sig["Signal"]:
+                t = trade_setup(price, atr, "SHORT", style, rr)
+                risk_amt = pos * t["risk_pct"] / 100
+                st.markdown(f"""
+                <div class="trade-short">
+                    <b>📉 SHORT</b><br>
+                    Entry &nbsp; <b>${t['entry']:,.2f}</b><br>
+                    🎯 TP &nbsp;&nbsp; <b>${t['tp']:,.2f}</b> &nbsp;(+{t['reward_pct']:.2f}%)<br>
+                    🛑 SL &nbsp;&nbsp; <b>${t['sl']:,.2f}</b> &nbsp;(-{t['risk_pct']:.2f}%)<br>
+                    💰 Risk &nbsp; <b>${risk_amt:.2f}</b> → Reward <b>${risk_amt*rr:.2f}</b>
+                </div>""", unsafe_allow_html=True)
             else:
-                st.warning(f"Key OK but got: {d.get('s')}")
-        else:
-            st.warning("Enter your API key first.")
+                st.markdown('<div class="trade-none">⏸️ No setup — wait for clear signal</div>',
+                            unsafe_allow_html=True)
 
-# ============================================
-# MAIN DASHBOARD
-# ============================================
 
-st.title("📊 Ultimate AI Trading Dashboard (Finnhub)")
-st.caption("🔧 Simplified: EMA 100/200 Only | 15m Scalping | 30m+1h Intraday")
+def render_chart(data: dict, symbol: str):
+    st.subheader("📈 Price Chart — EMA 100 & EMA 200 (1h)")
+    df = add_indicators(data["1h"])
 
-# Check API key
-if not st.session_state.finnhub_api_key:
-    st.warning("⚠️ Enter your Finnhub API key in the sidebar to continue.")
-    st.info("""
-**How to get your FREE Finnhub API key:**
-1. Go to **[https://finnhub.io](https://finnhub.io)**
-2. Click **"Get free API key"** → sign up
-3. Copy the key and paste it in the sidebar
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        row_heights=[0.6, 0.2, 0.2],
+                        vertical_spacing=0.03)
 
----
+    # Candles
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df.Open, high=df.High,
+        low=df.Low, close=df.Close, name="Price",
+        increasing_line_color="#2a9d8f", decreasing_line_color="#e76f51",
+    ), row=1, col=1)
 
-**✅ Supported symbols (copy-paste ready):**
+    # EMA 100
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df.EMA100, name="EMA 100",
+        line=dict(color="#e9c46a", width=2), opacity=.9,
+    ), row=1, col=1)
 
-| Asset | Symbol to enter |
-|-------|----------------|
-| Bitcoin | `BINANCE:BTCUSDT` |
-| Ethereum | `BINANCE:ETHUSDT` |
-| XRP | `BINANCE:XRPUSDT` |
-| Gold | `OANDA:XAU_USD` |
-| Silver | `OANDA:XAG_USD` |
-| EUR/USD | `OANDA:EUR_USD` |
-| Apple | `AAPL` |
-| Tesla | `TSLA` |
+    # EMA 200
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df.EMA200, name="EMA 200",
+        line=dict(color="#264653", width=3), opacity=.95,
+    ), row=1, col=1)
 
-**ℹ️ Free tier covers:** crypto candles (Binance) + forex candles (OANDA) + stock quotes.
-    """)
-    st.stop()
+    # BB shading
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df.BB_up, name="BB Upper",
+        line=dict(color="#4a5568", dash="dot", width=1),
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df.BB_lo, name="BB Lower",
+        line=dict(color="#4a5568", dash="dot", width=1),
+        fill="tonexty", fillcolor="rgba(74,85,104,0.08)",
+    ), row=1, col=1)
 
-# Live price ticker
-st.subheader("🌐 Live Market Feed")
-live_prices = get_live_prices(st.session_state.finnhub_api_key)
+    # RSI
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df.RSI, name="RSI",
+        line=dict(color="#a78bfa", width=1.5),
+    ), row=2, col=1)
+    fig.add_hline(y=70, line_color="#e76f51", line_dash="dot", row=2, col=1)
+    fig.add_hline(y=30, line_color="#2a9d8f", line_dash="dot", row=2, col=1)
 
-ticker_cols = st.columns(5)
-for idx, (name, data) in enumerate(live_prices.items()):
-    with ticker_cols[idx]:
-        price = data.get('price', 0)
-        change = data.get('change', 0)
-        color = "green" if change >= 0 else "red"
-        arrow = "▲" if change >= 0 else "▼"
-        # Format price: show more decimals for small values (forex)
-        price_str = f"${price:,.4f}" if price < 10 else f"${price:,.2f}"
-        st.markdown(f"""
-        <div class="price-ticker" style="border-left-color: {color};">
-            <div style="font-size: 12px; color: #888;">{name}</div>
-            <div style="font-size: 18px; font-weight: bold;">{price_str}</div>
-            <div style="font-size: 14px; color: {color};">
-                {arrow} {abs(change):.2f}%
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    # MACD
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df.MACD, name="MACD",
+        line=dict(color="#60a5fa", width=1.5),
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df.MACD_Sig, name="Signal",
+        line=dict(color="#f97316", width=1.5),
+    ), row=3, col=1)
+    colors = ["#2a9d8f" if v >= 0 else "#e76f51" for v in df.MACD_Hist]
+    fig.add_trace(go.Bar(
+        x=df.index, y=df.MACD_Hist, name="Histogram",
+        marker_color=colors, opacity=0.7,
+    ), row=3, col=1)
 
+    fig.update_layout(
+        height=750, template="plotly_dark",
+        paper_bgcolor="#080c12", plot_bgcolor="#080c12",
+        xaxis_rangeslider_visible=False,
+        showlegend=True, hovermode="x unified",
+        font=dict(family="DM Sans", color="#a0b4c8"),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font_size=11),
+    )
+    fig.update_yaxes(gridcolor="#1e2d3d", showgrid=True)
+    fig.update_xaxes(gridcolor="#1e2d3d", showgrid=False)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_prediction(data: dict):
+    st.subheader("🤖 AI Price Prediction")
+    p15 = predict(add_indicators(data["15m"]), "15m")
+    p1h = predict(add_indicators(data["1h"]),  "1h")
+
+    c1, c2 = st.columns(2)
+    for col, p, label in [(c1, p15, "Next 15m"), (c2, p1h, "Next 1h")]:
+        with col:
+            if p:
+                arrow_color = "#2a9d8f" if p["move_pct"] > 0 else "#e76f51"
+                st.markdown(f"""
+                <div class="prediction-box" style="background:linear-gradient(135deg,#0f1923,#131f2e);
+                     border:1px solid {arrow_color};border-radius:12px;padding:18px;">
+                    <div style="font-size:12px;color:#6b8cad;text-transform:uppercase;">{label}</div>
+                    <div style="font-family:'Space Mono';font-size:24px;color:#e8f4f8;margin:8px 0;">
+                        ${p['predicted']:,.2f} <span style="color:{arrow_color}">{p['direction']}</span>
+                    </div>
+                    <div style="font-size:15px;color:{arrow_color};font-weight:600;">
+                        {p['move_pct']:+.2f}% ({p['strength']})
+                    </div>
+                    <div style="font-size:12px;color:#6b8cad;margin-top:6px;">
+                        Range ${p['lower']:,.2f} — ${p['upper']:,.2f}
+                    </div>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.info("Not enough data for prediction")
+
+
+def render_backtest(data: dict):
+    st.subheader("🧪 Backtest — Prediction Accuracy")
+    tabs = st.tabs(["15m", "30m", "1h"])
+    for tab, tf in zip(tabs, ["15m", "30m", "1h"]):
+        with tab:
+            with st.spinner(f"Running {tf} backtest…"):
+                res = run_backtest(add_indicators(data[tf]))
+            if res is None:
+                st.warning("Not enough data")
+                continue
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Direction Acc.", f"{res['dir_acc']:.1f}%",   res['grade'])
+            c2.metric("Range Acc.",    f"{res['range_acc']:.1f}%")
+            c3.metric("Avg Error",     f"{res['mape']:.2f}%")
+            c4.metric("Recent (20)",   f"{res['recent_acc']:.1f}%",
+                      "Improving" if res['recent_acc'] > res['dir_acc'] else "Declining")
+
+            # chart
+            n = len(res['preds'])
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(y=res['acts'],  name="Actual",    line=dict(color="#2a9d8f",width=2)))
+            fig.add_trace(go.Scatter(y=res['preds'], name="Predicted", line=dict(color="#e9c46a",width=2,dash="dash")))
+            fig.update_layout(height=300, template="plotly_dark",
+                              paper_bgcolor="#0f1923", plot_bgcolor="#0f1923",
+                              title=f"Last {n} predictions vs actual")
+            st.plotly_chart(fig, use_container_width=True)
+
+            if res['dir_acc'] >= 65:
+                st.success("✅ Strong accuracy — trustworthy signals on this timeframe")
+            elif res['dir_acc'] >= 55:
+                st.warning("⚠️ Moderate accuracy — trade with confirmation")
+            else:
+                st.error("❌ Low accuracy on this timeframe — use longer TF")
+
+
+def render_news():
+    st.subheader("📰 Live Crypto & Market News")
+    items = get_news()
+    c1, c2 = st.columns(2)
+    for i, item in enumerate(items[:8]):
+        with (c1 if i % 2 == 0 else c2):
+            st.markdown(f"""
+            <div class="news-card">
+                <div class="news-title">{item['title']}</div>
+                <div class="news-meta">{item['time']} &nbsp;·&nbsp;
+                    <a href="{item['link']}" target="_blank"
+                       style="color:#2a9d8f;text-decoration:none;">Read →</a>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+
+def render_full_asset(symbol: str):
+    """Full single-asset analysis page."""
+    data = fetch_data(symbol)
+    if data is None:
+        st.error(f"Could not load data for **{symbol}**. Check the symbol and try again.")
+        return
+
+    # Price metrics
+    price    = float(data["15m"]["Close"].iloc[-1])
+    prev_day = float(data["1d"]["Close"].iloc[-2]) if len(data["1d"]) > 1 else price
+    chg24    = (price - prev_day) / prev_day * 100
+    hi24     = float(data["15m"]["High"].tail(96).max())
+    lo24     = float(data["15m"]["Low"].tail(96).min())
+    vol24    = float(data["15m"]["Volume"].tail(96).sum())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("💰 Price",     f"${price:,.4f}" if price < 5 else f"${price:,.2f}", f"{chg24:+.2f}%")
+    m2.metric("📈 24h High",  f"${hi24:,.2f}")
+    m3.metric("📉 24h Low",   f"${lo24:,.2f}")
+    m4.metric("📦 24h Volume",f"{vol24:,.0f}")
+
+    st.divider()
+
+    # Master signals
+    ms = master_signal(data)
+    render_master_signals(ms)
+
+    st.divider()
+
+    # Conflict check
+    sigs = {}
+    for tf in ["15m", "30m", "1h"]:
+        sigs[tf] = ema_signal(add_indicators(data[tf]))
+    cf = detect_conflicts(data, sigs)
+    render_conflict_panel(cf)
+
+    st.divider()
+
+    # TF scanner
+    sigs = render_tf_scanner(data)
+
+    st.divider()
+
+    # Trade setups
+    render_trade_setups(sigs, rr_ratio, pos_size)
+
+    st.divider()
+
+    # Prediction
+    render_prediction(data)
+
+    st.divider()
+
+    # Chart
+    render_chart(data, symbol)
+
+    # Backtest (optional)
+    if st.session_state.show_bt:
+        st.divider()
+        render_backtest(data)
+
+    st.divider()
+
+    # News
+    render_news()
+
+
+def render_compact_asset(symbol: str):
+    """Compact dual-pane view for multi-asset comparison."""
+    data = fetch_data(symbol)
+    if data is None:
+        st.error(f"No data for {symbol}")
+        return
+
+    price = float(data["15m"]["Close"].iloc[-1])
+    prev  = float(data["1d"]["Close"].iloc[-2]) if len(data["1d"]) > 1 else price
+    chg   = (price - prev) / prev * 100
+    pf    = f"${price:,.4f}" if price < 5 else f"${price:,.2f}"
+    color = "#2a9d8f" if chg >= 0 else "#e76f51"
+    st.markdown(
+        f'<div style="font-family:Space Mono;font-size:22px;color:#e8f4f8">{pf} '
+        f'<span style="font-size:14px;color:{color}">{chg:+.2f}%</span></div>',
+        unsafe_allow_html=True)
+
+    ms = master_signal(data)
+    render_master_signals(ms)
+
+    sigs = render_tf_scanner(data)
+    st.divider()
+    render_trade_setups(sigs, rr_ratio, pos_size)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN LAYOUT
+# ═══════════════════════════════════════════════════════════════
+
+st.markdown("""
+<h1 style="font-family:'Space Mono';font-size:28px;color:#e8f4f8;margin-bottom:0">
+    📊 PRO AI TRADING DESK
+</h1>
+<p style="color:#4a6a8a;font-size:13px;margin-top:4px">
+    EMA 100/200 · 15m Scalping · 30m+1h Intraday · Conflict Detection · Backtest
+</p>
+""", unsafe_allow_html=True)
+
+# Ticker row
+render_ticker_row()
 st.divider()
 
-# Main analysis
-if view_mode == "Single Asset":
-    symbol = st.session_state.current_symbol
-    st.subheader(f"📈 Analysis: {symbol}")
-    
-    data_sets = get_data_finnhub(symbol, st.session_state.finnhub_api_key)
-    
-    if data_sets:
-        current_price = data_sets['15m'].iloc[-1]['Close']
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("💰 Current Price", f"${current_price:,.2f}")
-        with col2:
-            high_24h = data_sets['15m']['High'].tail(96).max()  # 96 15-min = 24h
-            st.metric("📊 24h High", f"${high_24h:,.2f}")
-        with col3:
-            low_24h = data_sets['15m']['Low'].tail(96).min()
-            st.metric("📊 24h Low", f"${low_24h:,.2f}")
-        
-        st.divider()
-        
-        # MASTER SIGNALS
-        st.subheader("🎯 MASTER SIGNALS")
-        master_signals = calculate_master_signal_simplified(data_sets, st.session_state.finnhub_api_key)
-        
-        sig_col1, sig_col2 = st.columns(2)
-        
-        # Scalping
-        with sig_col1:
-            scalp_sig = master_signals['scalping']
-            
-            if "STRONG BUY" in scalp_sig['signal']:
-                bg_color, icon = "#00ff00", "🚀"
-            elif "BUY" in scalp_sig['signal']:
-                bg_color, icon = "#90EE90", "📈"
-            elif "SELL" in scalp_sig['signal']:
-                bg_color, icon = "#ff4b4b", "📉"
-            else:
-                bg_color, icon = "#808080", "⏸️"
-            
-            st.markdown(f"""
-            <div style="background-color: {bg_color}; padding: 20px; border-radius: 15px; text-align: center;">
-                <h3 style="margin: 0;">⚡ SCALPING (15m)</h3>
-                <div style="font-size: 32px; margin: 10px 0;">{icon} {scalp_sig['signal']}</div>
-                <div style="font-size: 18px;">Score: {scalp_sig['score']}/100</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            with st.expander("📋 See Why"):
-                for reason in scalp_sig['reasons']:
-                    st.write(reason)
-        
-        # Intraday
-        with sig_col2:
-            intra_sig = master_signals['intraday']
-            
-            if "STRONG BUY" in intra_sig['signal']:
-                bg_color, icon = "#00ff00", "🚀"
-            elif "BUY" in intra_sig['signal']:
-                bg_color, icon = "#90EE90", "📈"
-            elif "SELL" in intra_sig['signal']:
-                bg_color, icon = "#ff4b4b", "📉"
-            else:
-                bg_color, icon = "#808080", "⏸️"
-            
-            st.markdown(f"""
-            <div style="background-color: {bg_color}; padding: 20px; border-radius: 15px; text-align: center;">
-                <h3 style="margin: 0;">📅 INTRADAY (30m+1h)</h3>
-                <div style="font-size: 32px; margin: 10px 0;">{icon} {intra_sig['signal']}</div>
-                <div style="font-size: 18px;">Score: {intra_sig['score']}/100</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            with st.expander("📋 See Why"):
-                for reason in intra_sig['reasons']:
-                    st.write(reason)
-        
-        st.divider()
-        
-        # Timeframe scanner
-        st.subheader("⏰ Timeframe Scanner")
-        
-        tf_cols = st.columns(3)
-        timeframes = ['15m', '30m', '1h']
-        
-        for i, tf in enumerate(timeframes):
-            df = add_indicators(data_sets[tf])
-            sig = generate_signal_simplified(df, tf)
-            
-            with tf_cols[i]:
-                st.markdown(f"**{tf.upper()}**")
-                if sig:
-                    if "STRONG BUY" in sig['Signal']:
-                        st.markdown(f"<div class='signal-strong-buy'>{sig['Signal']}</div>", unsafe_allow_html=True)
-                    elif "STRONG SELL" in sig['Signal']:
-                        st.markdown(f"<div class='signal-strong-sell'>{sig['Signal']}</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"**{sig['Signal']}**")
-                    
-                    st.progress(sig['Score'] / 100)
-                    st.caption(f"Score: {sig['Score']}/100")
-                    st.write(f"RSI: {sig['RSI']}")
-                    st.write(f"ADX: {sig['ADX']}")
-                    
-                    with st.expander("Details"):
-                        for s in sig['Signals'][:3]:
-                            st.caption(s)
-        
-        st.divider()
-        
-        # Trade setups
-        st.subheader("🎯 Trade Setups")
-        
-        setup_cols = st.columns(2)
-        
-        # Scalping setup
-        with setup_cols[0]:
-            st.markdown("### ⚡ Scalping (15m)")
-            df_15m = add_indicators(data_sets['15m'])
-            sig_15m = generate_signal_simplified(df_15m, '15m')
-            
-            if sig_15m and "BUY" in sig_15m['Signal']:
-                trade = calculate_trade(sig_15m['Price'], sig_15m['ATR'], "LONG", "Scalp", risk_reward)
-                st.success("📈 LONG SETUP")
-                st.write(f"**Entry:** ${trade['entry']:,.2f}")
-                st.write(f"🎯 **TP:** ${trade['tp']:,.2f} (+{trade['reward_pct']:.2f}%)")
-                st.write(f"🛑 **SL:** ${trade['sl']:,.2f} (-{trade['risk_pct']:.2f}%)")
-                
-                risk_amount = position_size * (trade['risk_pct'] / 100)
-                st.info(f"💰 Risk: ${risk_amount:.2f}")
-                
-            elif sig_15m and "SELL" in sig_15m['Signal']:
-                trade = calculate_trade(sig_15m['Price'], sig_15m['ATR'], "SHORT", "Scalp", risk_reward)
-                st.error("📉 SHORT SETUP")
-                st.write(f"**Entry:** ${trade['entry']:,.2f}")
-                st.write(f"🎯 **TP:** ${trade['tp']:,.2f}")
-                st.write(f"🛑 **SL:** ${trade['sl']:,.2f}")
-                
-                risk_amount = position_size * (trade['risk_pct'] / 100)
-                st.info(f"💰 Risk: ${risk_amount:.2f}")
-            else:
-                st.info("⏸️ No Setup")
-        
-        # Intraday setup
-        with setup_cols[1]:
-            st.markdown("### 📅 Intraday (1h)")
-            df_1h = add_indicators(data_sets['1h'])
-            sig_1h = generate_signal_simplified(df_1h, '1h')
-            
-            if sig_1h and "BUY" in sig_1h['Signal']:
-                trade = calculate_trade(sig_1h['Price'], sig_1h['ATR'], "LONG", "Intraday", risk_reward)
-                st.success("📈 LONG SETUP")
-                st.write(f"**Entry:** ${trade['entry']:,.2f}")
-                st.write(f"🎯 **TP:** ${trade['tp']:,.2f} (+{trade['reward_pct']:.2f}%)")
-                st.write(f"🛑 **SL:** ${trade['sl']:,.2f} (-{trade['risk_pct']:.2f}%)")
-                
-                risk_amount = position_size * (trade['risk_pct'] / 100)
-                st.info(f"💰 Risk: ${risk_amount:.2f}")
-                
-            elif sig_1h and "SELL" in sig_1h['Signal']:
-                trade = calculate_trade(sig_1h['Price'], sig_1h['ATR'], "SHORT", "Intraday", risk_reward)
-                st.error("📉 SHORT SETUP")
-                st.write(f"**Entry:** ${trade['entry']:,.2f}")
-                st.write(f"🎯 **TP:** ${trade['tp']:,.2f}")
-                st.write(f"🛑 **SL:** ${trade['sl']:,.2f}")
-                
-                risk_amount = position_size * (trade['risk_pct'] / 100)
-                st.info(f"💰 Risk: ${risk_amount:.2f}")
-            else:
-                st.info("⏸️ No Setup")
-        
-        st.divider()
-        
-        # Chart
-        st.subheader("📈 Price Chart with EMA 100/200 (1H)")
-        
-        chart_df = add_indicators(data_sets['1h'])
-        
-        fig = go.Figure()
-        
-        # Candlesticks
-        fig.add_trace(go.Candlestick(
-            x=chart_df.index,
-            open=chart_df['Open'],
-            high=chart_df['High'],
-            low=chart_df['Low'],
-            close=chart_df['Close'],
-            name="Price"
-        ))
-        
-        # EMA 100
-        fig.add_trace(go.Scatter(
-            x=chart_df.index,
-            y=chart_df['EMA100'],
-            name="EMA 100",
-            line=dict(color='orange', width=2)
-        ))
-        
-        # EMA 200
-        fig.add_trace(go.Scatter(
-            x=chart_df.index,
-            y=chart_df['EMA200'],
-            name="EMA 200",
-            line=dict(color='blue', width=3)
-        ))
-        
-        fig.update_layout(
-            height=600,
-            xaxis_rangeslider_visible=False,
-            template="plotly_dark",
-            showlegend=True,
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-    else:
-        st.error("Failed to fetch data. Please check your API key and symbol format.")
+if st.session_state.view == "Single Asset":
+    st.markdown(f"### {st.session_state.symbol}")
+    render_full_asset(st.session_state.symbol)
 
 else:
-    # Multi-asset view
-    st.subheader(f"📊 Multi-Asset: {st.session_state.symbol_1} vs {st.session_state.symbol_2}")
-    
     col1, col2 = st.columns(2)
-    
-    for col, symbol in zip([col1, col2], [st.session_state.symbol_1, st.session_state.symbol_2]):
-        with col:
-            st.markdown(f"### {symbol}")
-            data = get_data_finnhub(symbol, st.session_state.finnhub_api_key)
-            
-            if data:
-                current = data['15m'].iloc[-1]['Close']
-                st.metric("Price", f"${current:,.2f}")
-                
-                master = calculate_master_signal_simplified(data, st.session_state.finnhub_api_key)
-                
-                st.markdown("**Signals:**")
-                st.write(f"⚡ Scalp: {master['scalping']['signal']} ({master['scalping']['score']}/100)")
-                st.write(f"📅 Intra: {master['intraday']['signal']} ({master['intraday']['score']}/100)")
-            else:
-                st.error("Failed to fetch data")
+    with col1:
+        st.markdown(f"### {st.session_state.sym1}")
+        render_compact_asset(st.session_state.sym1)
+    with col2:
+        st.markdown(f"### {st.session_state.sym2}")
+        render_compact_asset(st.session_state.sym2)
 
 # Auto-refresh
-if st.session_state.auto_refresh:
+if st.session_state.auto:
     time.sleep(60)
+    st.cache_data.clear()
     st.rerun()
