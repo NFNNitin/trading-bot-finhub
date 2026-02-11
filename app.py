@@ -70,128 +70,185 @@ if 'symbol_2' not in st.session_state:
 if 'finnhub_api_key' not in st.session_state:
     st.session_state.finnhub_api_key = ''
 
-# --- FINNHUB API FUNCTIONS ---
-def get_finnhub_candles(symbol, resolution, from_timestamp, to_timestamp, api_key):
-    """
-    Fetch candle data from Finnhub
-    Resolution: 1, 5, 15, 30, 60, D, W, M
-    """
-    url = "https://finnhub.io/api/v1/crypto/candle"
-    
-    params = {
-        'symbol': symbol,
-        'resolution': resolution,
-        'from': int(from_timestamp),
-        'to': int(to_timestamp),
-        'token': api_key
-    }
-    
+# ============================================================
+# FINNHUB API — SMART ROUTER
+# Crypto  → /crypto/candle   (symbol like BINANCE:BTCUSDT)
+# Forex   → /forex/candle    (symbol like OANDA:XAU_USD)
+# Stock   → /stock/candle    (symbol like AAPL)
+# Quote   → /quote           (stocks) | /crypto/profile2 (crypto)
+# ============================================================
+
+# Symbols the live-ticker will display and the correct Finnhub format
+TICKER_SYMBOLS = {
+    'Bitcoin':      {'finnhub': 'BINANCE:BTCUSDT',  'type': 'crypto'},
+    'Gold':         {'finnhub': 'OANDA:XAU_USD',     'type': 'forex'},
+    'Silver':       {'finnhub': 'OANDA:XAG_USD',     'type': 'forex'},
+    'Dollar Idx':   {'finnhub': 'OANDA:USD_CHF',     'type': 'forex'},
+    'XRP':          {'finnhub': 'BINANCE:XRPUSDT',   'type': 'crypto'},
+}
+
+def _symbol_type(symbol: str) -> str:
+    """Detect whether a symbol is crypto, forex, or stock."""
+    s = symbol.upper()
+    if ':' in s:
+        exchange = s.split(':')[0]
+        forex_exchanges = {'OANDA', 'FXCM', 'FX', 'FOREXCOM', 'IC MARKETS'}
+        if exchange in forex_exchanges:
+            return 'forex'
+        return 'crypto'          # BINANCE, COINBASE, KRAKEN, etc.
+    return 'stock'               # bare tickers like AAPL, TSLA
+
+def _candle_url(sym_type: str) -> str:
+    if sym_type == 'forex':
+        return 'https://finnhub.io/api/v1/forex/candle'
+    elif sym_type == 'stock':
+        return 'https://finnhub.io/api/v1/stock/candle'
+    else:
+        return 'https://finnhub.io/api/v1/crypto/candle'
+
+def _finnhub_get(url, params, timeout=12):
+    """Wrapper — returns (data_dict | None, error_str | None)."""
     try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        if data.get('s') == 'ok':
-            df = pd.DataFrame({
-                'timestamp': data['t'],
-                'Open': data['o'],
-                'High': data['h'],
-                'Low': data['l'],
-                'Close': data['c'],
-                'Volume': data['v']
-            })
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-            df.set_index('timestamp', inplace=True)
-            return df
-        else:
-            return None
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code == 401:
+            return None, "❌ Invalid API key — check the key you entered."
+        if r.status_code == 429:
+            return None, "⏳ Rate limit hit — wait 60 s then refresh."
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {r.text[:120]}"
+        return r.json(), None
+    except requests.exceptions.ConnectionError:
+        return None, "🔌 Network error — cannot reach finnhub.io"
     except Exception as e:
-        st.error(f"Finnhub API Error: {e}")
-        return None
+        return None, str(e)
+
+def get_finnhub_candles(symbol, resolution, from_ts, to_ts, api_key):
+    """
+    Fetch OHLCV candles from the correct Finnhub endpoint.
+    resolution: '15', '30', '60'  (minutes) or 'D'
+    Returns a DataFrame or None.
+    """
+    sym_type = _symbol_type(symbol)
+    url      = _candle_url(sym_type)
+
+    params = {
+        'symbol':     symbol,
+        'resolution': resolution,
+        'from':       int(from_ts),
+        'to':         int(to_ts),
+        'token':      api_key,
+    }
+
+    data, err = _finnhub_get(url, params)
+    if err:
+        return None, err
+
+    status = data.get('s', 'no_data')
+    if status != 'ok':
+        hint = ""
+        if status == 'no_data':
+            hint = " (market may be closed or symbol unsupported on free tier)"
+        return None, f"Finnhub returned '{status}'{hint} for {symbol}"
+
+    df = pd.DataFrame({
+        'Open':   data['o'],
+        'High':   data['h'],
+        'Low':    data['l'],
+        'Close':  data['c'],
+        'Volume': data['v'],
+    }, index=pd.to_datetime(data['t'], unit='s'))
+    df.index.name = 'timestamp'
+    return df.dropna(), None
 
 def get_data_finnhub(symbol, api_key):
     """
-    Fetches data for multiple timeframes using Finnhub API
-    Simplified: Only 15m for scalping, 30m and 1h for intraday
+    Fetch 15 m, 30 m, and 1 h candles for the given symbol.
+    Shows granular error messages so the user knows exactly what went wrong.
     """
     if not api_key:
-        st.error("Please enter your Finnhub API key in the sidebar")
-        return None
-    
-    try:
-        now = int(datetime.now().timestamp())
-        
-        data = {}
-        
-        # 15m data (last 3 days for scalping)
-        from_15m = now - (3 * 24 * 60 * 60)
-        data['15m'] = get_finnhub_candles(symbol, '15', from_15m, now, api_key)
-        
-        # 30m data (last 5 days for intraday)
-        from_30m = now - (5 * 24 * 60 * 60)
-        data['30m'] = get_finnhub_candles(symbol, '30', from_30m, now, api_key)
-        
-        # 1h data (last 10 days for intraday)
-        from_1h = now - (10 * 24 * 60 * 60)
-        data['1h'] = get_finnhub_candles(symbol, '60', from_1h, now, api_key)
-        
-        # Check if we got data
-        if all(v is not None and not v.empty for v in data.values()):
-            return data
-        else:
-            st.error("Failed to fetch complete data from Finnhub")
-            return None
-            
-    except Exception as e:
-        st.error(f"Data fetch error: {e}")
+        st.error("Please enter your Finnhub API key in the sidebar.")
         return None
 
-def get_live_quote_finnhub(symbol, api_key):
-    """Get real-time quote from Finnhub"""
-    url = "https://finnhub.io/api/v1/quote"
-    
-    params = {
-        'symbol': symbol,
-        'token': api_key
+    now      = int(datetime.utcnow().timestamp())
+    windows  = {
+        '15m': (now - 5  * 86400, '15'),   # 5 days
+        '30m': (now - 7  * 86400, '30'),   # 7 days
+        '1h':  (now - 14 * 86400, '60'),   # 14 days
     }
-    
-    try:
-        response = requests.get(url, params=params, timeout=5)
-        data = response.json()
-        
-        return {
-            'price': data.get('c', 0),  # Current price
-            'change': data.get('dp', 0),  # Percent change
-            'high': data.get('h', 0),
-            'low': data.get('l', 0),
-            'open': data.get('o', 0),
-            'prev_close': data.get('pc', 0)
-        }
-    except:
+
+    data   = {}
+    errors = {}
+
+    for tf, (from_ts, res) in windows.items():
+        df, err = get_finnhub_candles(symbol, res, from_ts, now, api_key)
+        if err:
+            errors[tf] = err
+        elif df is None or len(df) < 10:
+            errors[tf] = f"Too few candles returned ({0 if df is None else len(df)})"
+        else:
+            data[tf] = df
+
+    if errors:
+        st.error("**Finnhub data errors:**")
+        for tf, msg in errors.items():
+            st.error(f"• `{tf}`: {msg}")
+        if not data:
+            st.info("""
+**Common fixes:**
+- **Crypto:** Use `BINANCE:BTCUSDT`, `BINANCE:ETHUSDT`, `BINANCE:XRPUSDT`
+- **Gold / Silver:** Use `OANDA:XAU_USD` or `OANDA:XAG_USD`
+- **Forex:** Use `OANDA:EUR_USD`, `OANDA:GBP_USD`
+- **Stocks:** Just the ticker, e.g. `AAPL`, `TSLA`
+- The free Finnhub plan supports crypto candles and basic forex candles.
+            """)
+            return None
+        # partial data — still try to render
+        st.warning(f"Partial data: missing {list(errors.keys())}. Results may be limited.")
+
+    if len(data) < 2:
         return None
+    return data
 
 # --- LIVE PRICE FEED ---
+def get_live_quote_finnhub(symbol, sym_type, api_key):
+    """
+    Return {price, change} for any asset type.
+    Stocks   → /quote
+    Crypto   → /crypto/candle D (last two daily bars give % change)
+    Forex    → /forex/candle  D
+    """
+    if sym_type == 'stock':
+        url = 'https://finnhub.io/api/v1/quote'
+        d, _ = _finnhub_get(url, {'symbol': symbol, 'token': api_key})
+        if d and d.get('c'):
+            price = d['c']
+            prev  = d.get('pc', price)
+            chg   = ((price - prev) / prev * 100) if prev else 0
+            return {'price': price, 'change': chg}
+
+    else:  # crypto or forex
+        cand_url = _candle_url(sym_type)
+        now  = int(datetime.utcnow().timestamp())
+        from_ts = now - 3 * 86400
+        d, _ = _finnhub_get(cand_url, {
+            'symbol': symbol, 'resolution': 'D',
+            'from': from_ts, 'to': now, 'token': api_key
+        })
+        if d and d.get('s') == 'ok' and len(d.get('c', [])) >= 2:
+            price = d['c'][-1]
+            prev  = d['c'][-2]
+            chg   = ((price - prev) / prev * 100) if prev else 0
+            return {'price': price, 'change': chg}
+
+    return {'price': 0, 'change': 0}
+
+@st.cache_data(ttl=60)
 def get_live_prices(api_key):
-    """Fetches real-time prices for major assets"""
-    symbols = {
-        'BINANCE:BTCUSDT': 'Bitcoin',
-        'OANDA:XAU_USD': 'Gold',
-        'OANDA:XAG_USD': 'Silver',
-        'OANDA:USD_INDEX': 'Dollar Index',
-        'BINANCE:XRPUSDT': 'XRP'
-    }
-    
+    """Fetch ticker prices for the five headline assets."""
     prices = {}
-    for symbol, name in symbols.items():
-        quote = get_live_quote_finnhub(symbol, api_key)
-        if quote:
-            prices[name] = {
-                'price': quote['price'],
-                'change': quote['change'],
-                'symbol': symbol
-            }
-        else:
-            prices[name] = {'price': 0, 'change': 0, 'symbol': symbol}
-    
+    for name, meta in TICKER_SYMBOLS.items():
+        q = get_live_quote_finnhub(meta['finnhub'], meta['type'], api_key)
+        prices[name] = {**q, 'symbol': meta['finnhub']}
     return prices
 
 # --- SIMPLIFIED TECHNICAL INDICATORS (EMA 100 & 200 ONLY) ---
@@ -561,6 +618,30 @@ position_size = st.sidebar.number_input("Position Size ($)", min_value=100, valu
 
 st.sidebar.info(f"Last Refresh: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
 
+# ── API Diagnostic ──────────────────────────────────────────
+with st.sidebar.expander("🔎 API Diagnostic"):
+    if st.button("Test API Key", use_container_width=True):
+        if st.session_state.finnhub_api_key:
+            with st.spinner("Testing…"):
+                d, err = _finnhub_get(
+                    'https://finnhub.io/api/v1/crypto/candle',
+                    {
+                        'symbol': 'BINANCE:BTCUSDT',
+                        'resolution': '15',
+                        'from': int(datetime.utcnow().timestamp()) - 86400,
+                        'to':   int(datetime.utcnow().timestamp()),
+                        'token': st.session_state.finnhub_api_key,
+                    }
+                )
+            if err:
+                st.error(f"Test FAILED: {err}")
+            elif d and d.get('s') == 'ok':
+                st.success(f"✅ Key works! Got {len(d['t'])} BTC candles.")
+            else:
+                st.warning(f"Key OK but got: {d.get('s')}")
+        else:
+            st.warning("Enter your API key first.")
+
 # ============================================
 # MAIN DASHBOARD
 # ============================================
@@ -570,18 +651,29 @@ st.caption("🔧 Simplified: EMA 100/200 Only | 15m Scalping | 30m+1h Intraday")
 
 # Check API key
 if not st.session_state.finnhub_api_key:
-    st.warning("⚠️ Please enter your Finnhub API key in the sidebar to continue")
+    st.warning("⚠️ Enter your Finnhub API key in the sidebar to continue.")
     st.info("""
-    **How to get started:**
-    1. Go to [Finnhub.io](https://finnhub.io) 
-    2. Sign up for a FREE account
-    3. Get your API key
-    4. Enter it in the sidebar
-    
-    **Supported Symbols:**
-    - Crypto: `BINANCE:BTCUSDT`, `BINANCE:ETHUSDT`
-    - Forex: `OANDA:EUR_USD`, `OANDA:XAU_USD` (Gold)
-    - And many more!
+**How to get your FREE Finnhub API key:**
+1. Go to **[https://finnhub.io](https://finnhub.io)**
+2. Click **"Get free API key"** → sign up
+3. Copy the key and paste it in the sidebar
+
+---
+
+**✅ Supported symbols (copy-paste ready):**
+
+| Asset | Symbol to enter |
+|-------|----------------|
+| Bitcoin | `BINANCE:BTCUSDT` |
+| Ethereum | `BINANCE:ETHUSDT` |
+| XRP | `BINANCE:XRPUSDT` |
+| Gold | `OANDA:XAU_USD` |
+| Silver | `OANDA:XAG_USD` |
+| EUR/USD | `OANDA:EUR_USD` |
+| Apple | `AAPL` |
+| Tesla | `TSLA` |
+
+**ℹ️ Free tier covers:** crypto candles (Binance) + forex candles (OANDA) + stock quotes.
     """)
     st.stop()
 
@@ -592,13 +684,18 @@ live_prices = get_live_prices(st.session_state.finnhub_api_key)
 ticker_cols = st.columns(5)
 for idx, (name, data) in enumerate(live_prices.items()):
     with ticker_cols[idx]:
-        color = "green" if data['change'] >= 0 else "red"
+        price = data.get('price', 0)
+        change = data.get('change', 0)
+        color = "green" if change >= 0 else "red"
+        arrow = "▲" if change >= 0 else "▼"
+        # Format price: show more decimals for small values (forex)
+        price_str = f"${price:,.4f}" if price < 10 else f"${price:,.2f}"
         st.markdown(f"""
         <div class="price-ticker" style="border-left-color: {color};">
             <div style="font-size: 12px; color: #888;">{name}</div>
-            <div style="font-size: 18px; font-weight: bold;">${data['price']:,.2f}</div>
+            <div style="font-size: 18px; font-weight: bold;">{price_str}</div>
             <div style="font-size: 14px; color: {color};">
-                {'▲' if data['change'] >= 0 else '▼'} {abs(data['change']):.2f}%
+                {arrow} {abs(change):.2f}%
             </div>
         </div>
         """, unsafe_allow_html=True)
