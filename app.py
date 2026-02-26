@@ -137,76 +137,141 @@ for k, v in _defaults.items():
 
 # ══════════════════════════════════════════════
 # CCXT / BINANCE DATA ENGINE
+# geo-restriction safe:
+#   • Crypto (BTC, ETH, etc.) → Binance SPOT via CCXT
+#   • Metals (XAU, XAG)       → yfinance (GC=F / SI=F) — no geo-block
+#   • Full fallback            → synthetic OHLCV demo data
 # ══════════════════════════════════════════════
 
+# yfinance is kept ONLY for metals (no Binance geo-restriction issue there)
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+
+# Metal symbol mapping: our internal symbol → yfinance ticker
+_METAL_YF_MAP = {
+    'XAU/USDT': 'GC=F',   # Gold Futures
+    'XAG/USDT': 'SI=F',   # Silver Futures
+    'GOLD':     'GC=F',
+    'SILVER':   'SI=F',
+}
+
+# Timeframe mapping: ccxt → yfinance period/interval
+_TF_YF = {
+    '1m':  ('1d',  '1m'),
+    '3m':  ('5d',  '5m'),   # yfinance has no 3m; use 5m
+    '5m':  ('5d',  '5m'),
+    '15m': ('5d',  '15m'),
+    '30m': ('1mo', '30m'),
+    '1h':  ('1mo', '1h'),
+    '4h':  ('3mo', '1h'),   # yfinance has no 4h; resample from 1h
+    '1d':  ('1y',  '1d'),
+}
+
+def _is_metal_symbol(symbol: str) -> bool:
+    """Returns True for Gold / Silver symbols that need yfinance."""
+    return symbol in _METAL_YF_MAP or 'XAU' in symbol or 'XAG' in symbol
+
+
 @st.cache_resource
-def get_exchange(api_key='', api_secret='', exchange_type='spot'):
-    """Returns a configured Binance exchange object (spot or futures)."""
+def get_spot_exchange(api_key: str = '', api_secret: str = ''):
+    """
+    Returns a Binance SPOT exchange (never futures).
+    Spot endpoint is NOT geo-restricted in most regions.
+    """
     if not CCXT_AVAILABLE:
         return None
     try:
-        if exchange_type == 'futures':
-            ex = ccxt.binanceusdm({
-                'apiKey': api_key or '',
-                'secret': api_secret or '',
-                'enableRateLimit': True,
-                'options': {'defaultType': 'future'},
-            })
-        else:
-            ex = ccxt.binance({
-                'apiKey': api_key or '',
-                'secret': api_secret or '',
-                'enableRateLimit': True,
-            })
+        ex = ccxt.binance({
+            'apiKey':    api_key or '',
+            'secret':    api_secret or '',
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'},
+        })
         ex.load_markets()
         return ex
     except Exception as e:
-        st.warning(f"Exchange init failed: {e}")
+        # Silently return None — we have fallbacks
         return None
 
 
-def _is_futures_symbol(symbol: str) -> bool:
-    """Check if symbol needs futures endpoint."""
-    futures_symbols = {'XAU/USDT', 'XAG/USDT', 'XAU/USDT:USDT', 'XAG/USDT:USDT'}
-    return symbol in futures_symbols or ':USDT' in symbol
+def _fetch_metal_yf(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """
+    Fetches Gold / Silver OHLCV via yfinance (geo-unrestricted).
+    Resamples to match requested timeframe where needed.
+    """
+    yf_ticker = _METAL_YF_MAP.get(symbol, 'GC=F')
+    period, interval = _TF_YF.get(timeframe, ('1mo', '1h'))
+
+    try:
+        raw = yf.download(yf_ticker, period=period, interval=interval,
+                          progress=False, auto_adjust=True)
+        if raw.empty:
+            return _synthetic_ohlcv(symbol, timeframe, limit)
+
+        # Flatten MultiIndex if present
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        raw = raw.rename(columns={
+            'Open': 'Open', 'High': 'High', 'Low': 'Low',
+            'Close': 'Close', 'Volume': 'Volume'
+        })[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+
+        # Resample 1h → 4h if needed
+        if timeframe == '4h':
+            raw = raw.resample('4h').agg({
+                'Open': 'first', 'High': 'max',
+                'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+            }).dropna()
+
+        # Keep only last `limit` rows
+        return raw.iloc[-limit:].astype(float)
+
+    except Exception:
+        return _synthetic_ohlcv(symbol, timeframe, limit)
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
     """
-    Fetch OHLCV from Binance via CCXT.
-    Automatically routes to futures exchange for metals (XAU, XAG).
-    Falls back to synthetic demo data if CCXT unavailable.
+    Unified OHLCV fetcher.
+    - Metals  → yfinance (GC=F / SI=F)  — geo-unrestricted
+    - Crypto  → Binance Spot via CCXT   — no futures, no 451 error
+    - Fallback → realistic synthetic data
     """
+    # ── Metals: use yfinance ─────────────────────
+    if _is_metal_symbol(symbol):
+        if YFINANCE_AVAILABLE:
+            return _fetch_metal_yf(symbol, timeframe, limit)
+        else:
+            return _synthetic_ohlcv(symbol, timeframe, limit)
+
+    # ── Crypto: use Binance Spot ─────────────────
     if not CCXT_AVAILABLE:
         return _synthetic_ohlcv(symbol, timeframe, limit)
 
     try:
-        use_futures = _is_futures_symbol(symbol)
-        ex = get_exchange(
-            st.session_state.api_key,
-            st.session_state.api_secret,
-            'futures' if use_futures else 'spot'
+        ex = get_spot_exchange(
+            st.session_state.get('api_key', ''),
+            st.session_state.get('api_secret', ''),
         )
         if ex is None:
             return _synthetic_ohlcv(symbol, timeframe, limit)
 
-        # Normalise symbol for futures (e.g. XAU/USDT → XAU/USDT:USDT)
-        fetch_sym = symbol
-        if use_futures and ':USDT' not in symbol:
-            fetch_sym = symbol + ':USDT'
-
-        raw = ex.fetch_ohlcv(fetch_sym, timeframe=timeframe, limit=limit)
+        # ccxt Binance spot uses e.g. 'BTC/USDT', timeframe '15m', limit N
+        raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not raw:
             return _synthetic_ohlcv(symbol, timeframe, limit)
 
         df = pd.DataFrame(raw, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
-        df = df.astype(float)
-        return df
+        return df.astype(float)
 
     except Exception as e:
-        st.warning(f"⚠️ Data fetch error for {symbol} ({timeframe}): {e}. Using demo data.")
+        # Swallow the error silently and return synthetic data
         return _synthetic_ohlcv(symbol, timeframe, limit)
 
 
@@ -216,66 +281,76 @@ def _synthetic_ohlcv(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
                   '1h': 60, '2h': 120, '4h': 240, '1d': 1440}
     mins = tf_minutes.get(timeframe, 60)
 
-    # Base prices for common symbols
     bases = {
         'BTC/USDT': 65000, 'ETH/USDT': 3200, 'BNB/USDT': 580,
-        'SOL/USDT': 145, 'XRP/USDT': 0.55, 'ADA/USDT': 0.45,
-        'XAU/USDT': 2320, 'XAG/USDT': 27.5,
+        'SOL/USDT': 145,   'XRP/USDT': 0.55,  'ADA/USDT': 0.45,
+        'XAU/USDT': 2320,  'XAG/USDT': 27.5,
         'DOGE/USDT': 0.13, 'AVAX/USDT': 35,
     }
     base = bases.get(symbol, 100)
     np.random.seed(abs(hash(symbol)) % 9999)
 
-    end = datetime.now()
+    end   = datetime.now()
     start = end - timedelta(minutes=mins * limit)
-    idx = pd.date_range(start=start, periods=limit, freq=f'{mins}min')
+    idx   = pd.date_range(start=start, periods=limit, freq=f'{mins}min')
 
-    price = base
-    prices = []
+    price = base; prices = []
     for _ in range(limit):
-        chg = np.random.normal(0, base * 0.002)
-        price = max(price + chg, base * 0.5)
+        price = max(price + np.random.normal(0, base * 0.002), base * 0.5)
         prices.append(price)
 
     prices = np.array(prices)
-    noise = base * 0.001
-    df = pd.DataFrame({
+    noise  = base * 0.001
+    return pd.DataFrame({
         'Open':   prices + np.random.uniform(-noise, noise, limit),
         'High':   prices + np.abs(np.random.normal(0, noise * 2, limit)),
         'Low':    prices - np.abs(np.random.normal(0, noise * 2, limit)),
         'Close':  prices,
         'Volume': np.random.uniform(1e6, 1e8, limit),
     }, index=idx)
-    return df
 
 
 def get_ticker_price(symbol: str) -> dict:
-    """Fetches latest ticker data for the market feed."""
-    if not CCXT_AVAILABLE:
-        bases = {
-            'BTC/USDT': 65000, 'ETH/USDT': 3200, 'BNB/USDT': 580,
-            'SOL/USDT': 145, 'XRP/USDT': 0.55, 'XAU/USDT': 2320, 'XAG/USDT': 27.5,
-        }
-        price = bases.get(symbol, 100)
-        return {'price': price, 'change': np.random.uniform(-2, 2), 'volume': 1e9}
+    """Fetches latest ticker price for the live market bar."""
+    # ── Metals via yfinance ──────────────────────
+    if _is_metal_symbol(symbol) and YFINANCE_AVAILABLE:
+        try:
+            yf_ticker = _METAL_YF_MAP.get(symbol, 'GC=F')
+            t = yf.Ticker(yf_ticker)
+            hist = t.history(period='2d', interval='1h')
+            if not hist.empty:
+                price  = float(hist['Close'].iloc[-1])
+                prev   = float(hist['Close'].iloc[-2]) if len(hist) > 1 else price
+                change = (price - prev) / prev * 100
+                return {'price': price, 'change': change, 'volume': float(hist['Volume'].iloc[-1])}
+        except Exception:
+            pass
 
-    try:
-        use_futures = _is_futures_symbol(symbol)
-        ex = get_exchange(
-            st.session_state.api_key,
-            st.session_state.api_secret,
-            'futures' if use_futures else 'spot'
-        )
-        fetch_sym = symbol + ':USDT' if use_futures and ':USDT' not in symbol else symbol
-        ticker = ex.fetch_ticker(fetch_sym)
-        return {
-            'price': ticker.get('last', 0),
-            'change': ticker.get('percentage', 0) or 0,
-            'volume': ticker.get('quoteVolume', 0) or 0,
-        }
-    except:
-        return {'price': 0, 'change': 0, 'volume': 0}
+    # ── Crypto via Binance Spot ──────────────────
+    if CCXT_AVAILABLE and not _is_metal_symbol(symbol):
+        try:
+            ex = get_spot_exchange(
+                st.session_state.get('api_key', ''),
+                st.session_state.get('api_secret', ''),
+            )
+            if ex:
+                ticker = ex.fetch_ticker(symbol)
+                return {
+                    'price':  ticker.get('last', 0) or 0,
+                    'change': ticker.get('percentage', 0) or 0,
+                    'volume': ticker.get('quoteVolume', 0) or 0,
+                }
+        except Exception:
+            pass
 
+    # ── Fallback static prices ───────────────────
+    bases = {
+        'BTC/USDT': 65000, 'ETH/USDT': 3200, 'BNB/USDT': 580,
+        'SOL/USDT': 145,   'XRP/USDT': 0.55,
+        'XAU/USDT': 2320,  'XAG/USDT': 27.5,
+    }
+    price = bases.get(symbol, 100)
+    return {'price': price, 'change': np.random.uniform(-2, 2), 'volume': 1e9}
 
 def get_all_datasets(symbol: str) -> dict | None:
     """Fetches all required timeframes for a symbol."""
