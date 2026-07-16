@@ -14,8 +14,18 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import time
+import io
 import warnings
 warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────
+# PILLOW IMPORT (Trade Card export)
+# ─────────────────────────────────────────────
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # ─────────────────────────────────────────────
 # CCXT IMPORT (Binance API)
@@ -110,6 +120,31 @@ st.markdown("""
 
   /* Divider */
   hr { border-color: #1e2a3a !important; }
+
+  /* ── Mobile-friendly preset pills (RR / Position Size) ── */
+  div[role="radiogroup"] {
+    gap: 6px; flex-wrap: wrap;
+  }
+  div[role="radiogroup"] label {
+    background: #111827; border: 1px solid #1e2a3a; border-radius: 20px;
+    padding: 8px 14px !important; min-height: 40px; margin: 0 !important;
+  }
+  div[role="radiogroup"] label:has(input:checked) {
+    background: linear-gradient(135deg,#00c853,#1b5e20); border-color: #00e676;
+  }
+
+  /* Bigger, easier-to-tap buttons everywhere on small screens */
+  .stButton > button, .stDownloadButton > button {
+    min-height: 44px; border-radius: 10px;
+  }
+
+  /* ── Responsive tweaks for phone-width screens ── */
+  @media (max-width: 640px) {
+    .sig-main  { font-size: 22px; }
+    .sig-label { font-size: 11px; }
+    .ticker-price { font-size: 16px; }
+    .stButton > button, .stDownloadButton > button { width: 100%; }
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -130,6 +165,9 @@ _defaults = {
     'exchange_type': 'spot',        # 'spot' or 'futures'
     'api_key': '',
     'api_secret': '',
+    'display_mode': '🎯 Simple',
+    'last_backtest': None,
+    'last_backtest_meta': None,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -1177,6 +1215,96 @@ def detect_regime(df: pd.DataFrame) -> dict | None:
             'adx': adx, 'bb_width': bb_w, 'above200': above200}
 
 # ══════════════════════════════════════════════
+# DIVERGENCE DETECTION (RSI / MACD vs Price)
+# ══════════════════════════════════════════════
+
+def _find_swings(series: pd.Series, order: int = 3) -> tuple[list, list]:
+    """Returns positional indices of local maxima (swing highs) and minima
+    (swing lows) in a series, using a simple `order`-bar lookback/lookahead
+    comparison window."""
+    highs, lows = [], []
+    for i in range(order, len(series) - order):
+        window = series.iloc[i - order:i + order + 1]
+        val = series.iloc[i]
+        if val == window.max():
+            highs.append(i)
+        if val == window.min():
+            lows.append(i)
+    return highs, lows
+
+
+def detect_divergence(df: pd.DataFrame, lookback: int = 60) -> list[dict]:
+    """
+    Scans the last `lookback` candles for classic RSI / MACD-histogram
+    divergences: compares the two most recent price swing highs (or lows)
+    against the oscillator's value at those same points.
+      • Bearish divergence: price makes a higher-high, oscillator makes a lower-high
+      • Bullish divergence: price makes a lower-low,  oscillator makes a higher-low
+    """
+    if len(df) < lookback + 10:
+        return []
+    sub = df.iloc[-lookback:].reset_index(drop=True)
+    price = sub['Close']
+    results = []
+
+    for ind_name, ind_col in [('RSI', 'RSI'), ('MACD', 'MACD_Hist')]:
+        if ind_col not in sub.columns or sub[ind_col].isna().all():
+            continue
+        ind_series = sub[ind_col]
+        highs, lows = _find_swings(price, order=3)
+
+        if len(highs) >= 2:
+            h1, h2 = highs[-2], highs[-1]
+            if price.iloc[h2] > price.iloc[h1] and ind_series.iloc[h2] < ind_series.iloc[h1]:
+                results.append({
+                    'type': 'Bearish', 'indicator': ind_name,
+                    'note': f"Price posted a higher high but {ind_name} posted a lower high — upside momentum is fading",
+                })
+
+        if len(lows) >= 2:
+            l1, l2 = lows[-2], lows[-1]
+            if price.iloc[l2] < price.iloc[l1] and ind_series.iloc[l2] > ind_series.iloc[l1]:
+                results.append({
+                    'type': 'Bullish', 'indicator': ind_name,
+                    'note': f"Price posted a lower low but {ind_name} posted a higher low — downside momentum is fading",
+                })
+    return results
+
+# ══════════════════════════════════════════════
+# FIBONACCI RETRACEMENT / EXTENSION LEVELS
+# ══════════════════════════════════════════════
+
+def calc_fibonacci_levels(df: pd.DataFrame, lookback: int = 90) -> dict | None:
+    """Computes Fibonacci retracement + extension levels from the most
+    significant swing high/low within the lookback window."""
+    if len(df) < 10:
+        return None
+    lookback = min(lookback, len(df))
+    sub = df.iloc[-lookback:]
+    swing_high = float(sub['High'].max())
+    swing_low = float(sub['Low'].min())
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return None
+    uptrend = sub['Close'].iloc[-1] >= sub['Close'].iloc[0]
+
+    retracements = {
+        '0.0%':   swing_high,
+        '23.6%':  swing_high - 0.236 * diff,
+        '38.2%':  swing_high - 0.382 * diff,
+        '50.0%':  swing_high - 0.5   * diff,
+        '61.8%':  swing_high - 0.618 * diff,
+        '78.6%':  swing_high - 0.786 * diff,
+        '100%':   swing_low,
+    }
+    extensions = {
+        '127.2%': swing_high + 0.272 * diff if uptrend else swing_low - 0.272 * diff,
+        '161.8%': swing_high + 0.618 * diff if uptrend else swing_low - 0.618 * diff,
+    }
+    return {'swing_high': swing_high, 'swing_low': swing_low,
+            'retracements': retracements, 'extensions': extensions, 'uptrend': uptrend}
+
+# ══════════════════════════════════════════════
 # NEWS FEED
 # ══════════════════════════════════════════════
 
@@ -1212,6 +1340,216 @@ def calc_trade(price, atr, direction='LONG', style='Scalp', rr=2.0):
     return {'entry': price, 'sl': sl, 'tp': tp, 'breakeven': be,
             'risk_pct': sl_dist / price * 100, 'reward_pct': tp_dist / price * 100,
             'rr': rr}
+
+# ══════════════════════════════════════════════
+# BACKTEST ENGINE (walk-forward signal replay)
+# ══════════════════════════════════════════════
+
+def backtest_signals(df_full: pd.DataFrame, timeframe: str, rr: float = 2.0,
+                      style: str = 'Scalp', lookahead: int = 40,
+                      max_samples: int = 120) -> dict | None:
+    """
+    Walk-forward replay of generate_signal() + calc_trade() across history.
+    At each sampled bar i, a signal is generated using ONLY data up to and
+    including bar i (no lookahead bias — every indicator is a rolling/causal
+    function of past bars). The next `lookahead` bars are then scanned to see
+    whether Take-Profit or Stop-Loss would have been hit first.
+
+    This is a real (if simplified) historical replay — not a hard-coded
+    number — so results will vary by symbol/timeframe/market conditions,
+    same as any backtest.
+    """
+    min_bars = 210
+    n = len(df_full)
+    if n < min_bars + lookahead + 10:
+        return None
+
+    span = n - min_bars - lookahead
+    step = max(1, span // max_samples)
+
+    trades = []
+    for i in range(min_bars, n - lookahead, step):
+        sig = generate_signal(df_full.iloc[:i + 1], timeframe)
+        if not sig:
+            continue
+
+        if "STRONG BUY" in sig['Signal'] or ("BUY" in sig['Signal'] and "SELL" not in sig['Signal']):
+            direction = 'LONG'
+        elif "SELL" in sig['Signal']:
+            direction = 'SHORT'
+        else:
+            continue  # skip NEUTRAL bars — no trade taken
+
+        trade = calc_trade(sig['Price'], sig['ATR'], direction, style, rr)
+        future = df_full.iloc[i + 1: i + 1 + lookahead]
+
+        outcome, exit_price, bars_held = None, None, 0
+        for j, (_, row) in enumerate(future.iterrows(), start=1):
+            if direction == 'LONG':
+                hit_sl, hit_tp = row['Low'] <= trade['sl'], row['High'] >= trade['tp']
+            else:
+                hit_sl, hit_tp = row['High'] >= trade['sl'], row['Low'] <= trade['tp']
+            if hit_sl:  # conservative: if both hit same candle, assume SL first
+                outcome, exit_price, bars_held = 'LOSS', trade['sl'], j
+                break
+            if hit_tp:
+                outcome, exit_price, bars_held = 'WIN', trade['tp'], j
+                break
+
+        if outcome is None:
+            # Neither level hit within the lookahead window — mark to market
+            last_close = future['Close'].iloc[-1] if len(future) else trade['entry']
+            moved_favorably = (last_close > trade['entry']) if direction == 'LONG' else (last_close < trade['entry'])
+            outcome, exit_price, bars_held = ('WIN' if moved_favorably else 'LOSS'), last_close, len(future)
+
+        trades.append({
+            'time': df_full.index[i], 'direction': direction, 'signal': sig['Signal'],
+            'score': sig['Score'], 'entry': trade['entry'], 'sl': trade['sl'], 'tp': trade['tp'],
+            'outcome': outcome, 'exit': exit_price, 'bars_held': bars_held,
+        })
+
+    if not trades:
+        return None
+
+    wins = [t for t in trades if t['outcome'] == 'WIN']
+    losses = [t for t in trades if t['outcome'] == 'LOSS']
+    r_per_trade = [rr if t['outcome'] == 'WIN' else -1.0 for t in trades]
+    equity_curve = np.cumsum(r_per_trade).tolist()
+
+    return {
+        'trades': trades,
+        'total': len(trades),
+        'wins': len(wins),
+        'losses': len(losses),
+        'win_rate': len(wins) / len(trades) * 100,
+        'expectancy_r': float(np.mean(r_per_trade)),
+        'total_r': float(np.sum(r_per_trade)),
+        'equity_curve': equity_curve,
+    }
+
+# ══════════════════════════════════════════════
+# TRADE SETUP CARD (shareable PNG export)
+# ══════════════════════════════════════════════
+
+def _card_font(size: int, bold: bool = False):
+    """Loads a truetype font with graceful fallback to PIL default."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def generate_trade_card_image(symbol: str, direction: str, style: str,
+                               trade: dict, confluence: float | None = None) -> bytes:
+    """
+    Renders a clean, shareable 1080x1080 'Trade Setup Card' PNG summarising
+    a signal (coin, direction, entry/SL/TP, confluence score) for posting
+    on Instagram / Twitter / TikTok. Returns raw PNG bytes.
+    """
+    W = H = 1080
+    is_long = direction == "LONG"
+    accent = (0, 230, 118) if is_long else (255, 82, 82)          # green / red
+    bg_top = (10, 14, 23)
+    bg_bot = (17, 24, 39)
+
+    img = Image.new("RGB", (W, H), bg_top)
+    draw = ImageDraw.Draw(img)
+
+    # Vertical gradient background
+    for y in range(H):
+        t = y / H
+        r = int(bg_top[0] + (bg_bot[0] - bg_top[0]) * t)
+        g = int(bg_top[1] + (bg_bot[1] - bg_top[1]) * t)
+        b = int(bg_top[2] + (bg_bot[2] - bg_top[2]) * t)
+        draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+    # Card border accent
+    draw.rectangle([(0, 0), (W - 1, 14)], fill=accent)
+
+    f_brand   = _card_font(30, bold=True)
+    f_symbol  = _card_font(70, bold=True)
+    f_dir     = _card_font(54, bold=True)
+    f_label   = _card_font(26)
+    f_value   = _card_font(46, bold=True)
+    f_small   = _card_font(24)
+    f_disclaimer = _card_font(20)
+
+    # Branding
+    draw.text((60, 50), "🏛️ INSTITUTIONAL AI TRADER", font=f_brand, fill=(107, 122, 141))
+
+    # Symbol + style
+    draw.text((60, 110), symbol, font=f_symbol, fill=(240, 240, 240))
+    draw.text((60, 195), f"{style.upper()} SETUP", font=f_small, fill=(107, 122, 141))
+
+    # Direction pill
+    pill_txt = f"{'📈 LONG' if is_long else '📉 SHORT'}"
+    draw.rounded_rectangle([(60, 250), (420, 330)], radius=18, fill=accent)
+    draw.text((90, 268), pill_txt, font=f_dir, fill=(10, 14, 23))
+
+    # Confluence score
+    if confluence is not None:
+        draw.text((680, 260), "CONFLUENCE", font=f_label, fill=(107, 122, 141))
+        draw.text((680, 292), f"{confluence:.1f}/100", font=f_dir, fill=(240, 240, 240))
+
+    # Divider
+    draw.line([(60, 380), (W - 60, 380)], fill=(30, 42, 58), width=2)
+
+    # Entry / SL / TP rows
+    rows = [
+        ("ENTRY",       f"${trade['entry']:,.4f}", (240, 240, 240)),
+        ("STOP-LOSS",   f"${trade['sl']:,.4f}",    (255, 82, 82)),
+        ("TAKE-PROFIT", f"${trade['tp']:,.4f}",    (0, 230, 118)),
+    ]
+    y = 430
+    for label, value, color in rows:
+        draw.text((60, y), label, font=f_label, fill=(107, 122, 141))
+        draw.text((60, y + 34), value, font=f_value, fill=color)
+        y += 130
+
+    # Risk / Reward footer stats
+    draw.line([(60, y + 10), (W - 60, y + 10)], fill=(30, 42, 58), width=2)
+    stat_y = y + 40
+    draw.text((60, stat_y), f"Risk/Reward  1 : {trade['rr']:.1f}", font=f_small, fill=(200, 200, 200))
+    draw.text((60, stat_y + 34), f"Risk {trade['risk_pct']:.2f}%  ·  Reward {trade['reward_pct']:.2f}%",
+              font=f_small, fill=(200, 200, 200))
+
+    # Timestamp
+    draw.text((60, stat_y + 80), datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
+              font=f_small, fill=(107, 122, 141))
+
+    # Disclaimer footer
+    disclaimer = ("⚠️ Educational purposes only — not financial advice. "
+                  "Trading crypto/leverage is high risk.")
+    draw.rectangle([(0, H - 70), (W, H)], fill=(13, 17, 23))
+    draw.text((60, H - 50), disclaimer, font=f_disclaimer, fill=(150, 150, 150))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def render_export_card_button(symbol: str, direction: str, style: str,
+                                trade: dict, confluence: float | None, key: str):
+    """Small download button that renders + offers a shareable Trade Card PNG."""
+    if not PIL_AVAILABLE:
+        st.caption("ℹ️ Install `Pillow` to enable Trade Card export.")
+        return
+    png_bytes = generate_trade_card_image(symbol, direction, style, trade, confluence)
+    st.download_button(
+        "📸 Export Setup Card",
+        data=png_bytes,
+        file_name=f"{symbol.replace('/', '')}_{style}_{direction}.png",
+        mime="image/png",
+        key=key,
+        use_container_width=True,
+    )
 
 # ══════════════════════════════════════════════
 # ═══════  RENDER HELPERS  ════════════════════
@@ -1295,7 +1633,8 @@ def render_conflict_panel(conflict: dict):
         st.warning(f"{w['msg']} — {w['action']}")
 
 
-def render_timeframe_scanner(datasets: dict, rr: float, pos_size: float):
+def render_timeframe_scanner(datasets: dict, rr: float, pos_size: float,
+                              symbol: str = "", confluence: float | None = None):
     """Full multi-timeframe scanner + trade setups."""
     st.subheader("⏰ Multi-Timeframe Scanner")
     tfs = ['15m', '30m', '1h', '4h', '1d']
@@ -1359,6 +1698,7 @@ def render_timeframe_scanner(datasets: dict, rr: float, pos_size: float):
                 st.write(f"🛑 SL: ${t['sl']:,.4f} (-{t['risk_pct']:.2f}%)")
                 st.write(f"⚖️ BE: ${t['breakeven']:,.4f}")
                 st.caption(f"Risk $: ${pos_size * t['risk_pct'] / 100:.2f}")
+                render_export_card_button(symbol, direction, "Scalp", t, confluence, key="export_scalp")
             else:
                 st.info("⏸ No Setup")
 
@@ -1374,6 +1714,7 @@ def render_timeframe_scanner(datasets: dict, rr: float, pos_size: float):
                 st.write(f"🎯 TP: ${t['tp']:,.4f} (+{t['reward_pct']:.2f}%)")
                 st.write(f"🛑 SL: ${t['sl']:,.4f} (-{t['risk_pct']:.2f}%)")
                 st.caption(f"Risk $: ${pos_size * t['risk_pct'] / 100:.2f}")
+                render_export_card_button(symbol, "LONG", "Intraday", t, confluence, key="export_intra_long")
             elif "SELL" in s30['Signal'] and "SELL" in s1h['Signal']:
                 t = calc_trade(s1h['Price'], s1h['ATR'], 'SHORT', 'Intraday', rr)
                 st.error("📉 SHORT (Aligned)")
@@ -1381,6 +1722,7 @@ def render_timeframe_scanner(datasets: dict, rr: float, pos_size: float):
                 st.write(f"🎯 TP: ${t['tp']:,.4f} (+{t['reward_pct']:.2f}%)")
                 st.write(f"🛑 SL: ${t['sl']:,.4f} (-{t['risk_pct']:.2f}%)")
                 st.caption(f"Risk $: ${pos_size * t['risk_pct'] / 100:.2f}")
+                render_export_card_button(symbol, "SHORT", "Intraday", t, confluence, key="export_intra_short")
             else:
                 st.warning("⏸ Wait – Timeframes not aligned")
 
@@ -1398,6 +1740,7 @@ def render_timeframe_scanner(datasets: dict, rr: float, pos_size: float):
                 st.write(f"🎯 TP: ${t['tp']:,.4f} (+{t['reward_pct']:.2f}%)")
                 st.write(f"🛑 SL: ${t['sl']:,.4f} (-{t['risk_pct']:.2f}%)")
                 st.caption(f"Risk $: ${pos_size * t['risk_pct'] / 100:.2f}")
+                render_export_card_button(symbol, direction, "Swing", t, confluence, key="export_swing")
             else:
                 st.info("⏸ No Setup")
 
@@ -1589,6 +1932,255 @@ def render_confluence_panel(symbol: str, datasets: dict, news: list):
         st.success(f"🔔 **ALERT!** Confluence {confluence:.1f}% exceeded threshold "
                    f"({st.session_state.alert_threshold}%) — Institutional-grade setup detected!")
 
+    return confluence
+
+
+def render_divergence_fib_panel(datasets: dict):
+    """Divergence signals + Fibonacci retracement/extension levels (1H)."""
+    st.subheader("🔀 Divergence & Fibonacci Levels")
+    df1h = add_indicators(datasets['1h'])
+    divs = detect_divergence(df1h, lookback=60)
+    fib = calc_fibonacci_levels(datasets['1h'], lookback=90)
+    price = datasets['1h']['Close'].iloc[-1]
+
+    dc, fc = st.columns(2)
+    with dc:
+        st.markdown("**RSI / MACD Divergence**")
+        if divs:
+            for d in divs:
+                icon = "🟢" if d['type'] == 'Bullish' else "🔴"
+                st.markdown(f"{icon} **{d['type']} Divergence ({d['indicator']})**")
+                st.caption(d['note'])
+        else:
+            st.caption("No clear divergence in the last 60 candles.")
+
+    with fc:
+        st.markdown("**Fibonacci Levels (last 90 candles)**")
+        if fib:
+            for lbl, lvl in fib['retracements'].items():
+                marker = " 👈 price here" if abs(price - lvl) / lvl < 0.004 else ""
+                st.caption(f"{lbl}: ${lvl:,.4f}{marker}")
+            st.caption(f"Ext 127.2%: ${fib['extensions']['127.2%']:,.4f}")
+            st.caption(f"Ext 161.8%: ${fib['extensions']['161.8%']:,.4f}")
+        else:
+            st.caption("Not enough data for Fibonacci levels.")
+
+
+def render_backtest_tab():
+    """Standalone backtest tab — user picks symbol/timeframe/style, runs a
+    walk-forward replay of the signal engine, sees win rate + equity curve."""
+    st.markdown("## 🕰️ Signal Backtest")
+    st.caption(
+        "Replays the signal engine bar-by-bar through history — every signal only "
+        "uses data available up to that point (no lookahead bias) — then checks whether "
+        "price hit Take-Profit or Stop-Loss first. Past performance is simulated and "
+        "does not guarantee future results."
+    )
+
+    bc1, bc2, bc3, bc4 = st.columns(4)
+    with bc1:
+        bt_symbol = st.text_input("Symbol", value=st.session_state.current_symbol, key="bt_symbol").upper()
+    with bc2:
+        bt_style = st.selectbox("Style", ["Scalp", "Intraday", "Swing"], index=1, key="bt_style")
+    with bc3:
+        bt_tf = {"Scalp": "15m", "Intraday": "1h", "Swing": "4h"}[bt_style]
+        st.text_input("Timeframe (auto)", value=bt_tf, disabled=True, key="bt_tf_display")
+    with bc4:
+        bt_rr = st.selectbox("Risk:Reward", [1.0, 1.5, 2.0, 2.5, 3.0], index=2, key="bt_rr")
+
+    run = st.button("▶️ Run Backtest", use_container_width=True, type="primary")
+
+    if run:
+        with st.spinner(f"Replaying signals for {bt_symbol} ({bt_tf})..."):
+            df = fetch_ohlcv(bt_symbol, bt_tf, limit=500)
+            df = add_indicators(df)
+            result = backtest_signals(df, bt_tf, rr=bt_rr, style=bt_style, lookahead=40)
+        st.session_state['last_backtest'] = result
+        st.session_state['last_backtest_meta'] = {'symbol': bt_symbol, 'style': bt_style, 'tf': bt_tf, 'rr': bt_rr}
+
+    result = st.session_state.get('last_backtest')
+    meta = st.session_state.get('last_backtest_meta')
+
+    if not result:
+        st.info("Pick a symbol/style above and tap **Run Backtest** to see historical win rate stats.")
+        return
+
+    st.divider()
+    st.markdown(f"#### Results — {meta['symbol']} · {meta['style']} ({meta['tf']}) · R:R 1:{meta['rr']}")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Signals", result['total'])
+    m2.metric("Win Rate", f"{result['win_rate']:.1f}%")
+    m3.metric("Expectancy", f"{result['expectancy_r']:+.2f}R / trade")
+    m4.metric("Total Return", f"{result['total_r']:+.1f}R")
+
+    if result['win_rate'] >= 50 and result['expectancy_r'] > 0:
+        st.success("✅ Positive expectancy over this sample — engine caught more winners than losers at this R:R.")
+    else:
+        st.warning("⚠️ Negative or breakeven expectancy over this sample. Try a different R:R, style, or symbol.")
+
+    # Equity curve
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        y=result['equity_curve'], mode='lines',
+        line=dict(color='#00e676' if result['total_r'] >= 0 else '#ff5252', width=2),
+        fill='tozeroy', fillcolor='rgba(0,230,118,0.08)', name='Cumulative R',
+    ))
+    fig.update_layout(
+        title="Cumulative R Multiple by Trade #", template='plotly_dark',
+        height=320, margin=dict(l=40, r=20, t=40, b=20),
+        xaxis_title="Trade #", yaxis_title="Cumulative R",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander(f"📋 Trade Log ({len(result['trades'])} signals)"):
+        log_df = pd.DataFrame(result['trades'])[['time', 'direction', 'signal', 'score', 'entry', 'sl', 'tp', 'outcome', 'bars_held']]
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "⚠️ Simulated historical replay, not a live audited track record. Real trading involves "
+        "slippage, fees, and liquidity that this backtest does not model."
+    )
+
+
+def render_education_tab():
+    """Static educational content — the free alternative to paid TA courses."""
+    st.markdown("## 📚 Learn: How This Tool Works")
+    st.caption("Everything below explains exactly what the dashboard is measuring — no paid course needed.")
+
+    with st.expander("🎯 How the Confluence Score is calculated", expanded=True):
+        st.markdown("""
+The **Confluence Score** (0–100) blends four independent categories so no single indicator can dominate:
+
+| Category | Weight | What it measures |
+|---|---|---|
+| 📈 Technical | 40% | EMA200 trend filter, Supertrend, EMA stack, Ichimoku Cloud, RSI, StochRSI, MACD, ADX, Bollinger Bands, CCI, Williams %R, MFI, OBV, Elder Ray, VWAP |
+| 🎯 Regime | 25% | Is the market trending, ranging, or in a volatility squeeze? |
+| 💼 Order Flow | 20% | Are recent candles showing aggressive buying/selling or absorption? |
+| 📰 Sentiment | 15% | Keyword-scored bias from recent crypto news headlines |
+
+Above **78** = institutional-grade confluence. **63–78** = high quality. **50–63** = moderate. Below **50** = low quality, best avoided.
+""")
+
+    with st.expander("🟢🔴 Reading the Signal Labels"):
+        st.markdown("""
+- **STRONG BUY / STRONG SELL** — score ≥78 or ≤37, most indicators agree
+- **BUY / SELL** — score 63–78 or 37–50, majority agreement
+- **NEUTRAL / HOLD** — score 50–63, no clear edge — sitting out is a valid trade
+
+The score is a weighted sum of ~16 individual technical checks (trend, momentum, volatility, volume) normalised to 0–100.
+""")
+
+    with st.expander("📈 Trend Indicators"):
+        st.markdown("""
+- **EMA (Exponential Moving Average)**: average price that reacts faster to recent candles than a simple average. Price above a rising EMA = uptrend bias.
+- **Supertrend**: an ATR-based trailing line that flips above/below price to mark trend direction — widely used for trailing stops.
+- **Ichimoku Cloud**: a Japanese trend system; price above the "cloud" (Span A/B) = bullish structure, below = bearish.
+- **ADX (Average Directional Index)**: measures trend *strength*, not direction. Above 25 = trending; below 18 = choppy/range-bound.
+""")
+
+    with st.expander("⚡ Momentum Indicators"):
+        st.markdown("""
+- **RSI (Relative Strength Index)**: 0–100 scale of recent gains vs losses. >70 overbought, <30 oversold.
+- **Stochastic RSI**: RSI applied to itself for a faster, more sensitive oscillator.
+- **MACD**: difference between two EMAs; crossovers signal shifting momentum.
+- **CCI / Williams %R**: alternate overbought/oversold oscillators that help confirm RSI readings.
+""")
+
+    with st.expander("📊 Volume & Order Flow"):
+        st.markdown("""
+- **OBV (On-Balance Volume)**: running total of volume, added on up days and subtracted on down days — rising OBV confirms a price uptrend.
+- **MFI (Money Flow Index)**: "volume-weighted RSI" — extreme readings can flag smart-money accumulation/distribution.
+- **VWAP**: volume-weighted average price — a common institutional fair-value reference.
+- **Order Flow panel**: scans the last 10 candles for aggressive buying/selling (large range + high volume closes) and absorption (high volume, small body).
+""")
+
+    with st.expander("🔀 Divergence"):
+        st.markdown("""
+Divergence happens when **price** and an **oscillator (RSI/MACD)** disagree:
+- **Bearish divergence**: price makes a higher high, but RSI/MACD makes a *lower* high → upside momentum is fading, a pullback or reversal may follow.
+- **Bullish divergence**: price makes a lower low, but RSI/MACD makes a *higher* low → downside momentum is fading.
+
+Divergence is a warning sign, not a standalone entry signal — it's most useful combined with the confluence score and support/resistance levels.
+""")
+
+    with st.expander("📐 Fibonacci Retracement & Extension"):
+        st.markdown("""
+Fibonacci levels are drawn between a recent swing high and swing low. Retracement levels (23.6%, 38.2%, 50%, 61.8%, 78.6%) mark where a pullback within a trend often pauses or reverses. Extension levels (127.2%, 161.8%) project potential targets *beyond* the original swing if the trend continues. They work because enough traders watch the same levels that they can become somewhat self-fulfilling — not because of any inherent market law.
+""")
+
+    with st.expander("🚨 Conflict / Risk Panel"):
+        st.markdown("""
+Before trusting any signal, the app cross-checks it for red flags:
+- Disagreement between 15m and 1H signals
+- A BUY signal while price is actually falling (or vice versa)
+- RSI already overbought on a fresh BUY (or oversold on a SELL)
+- A "STRONG" signal appearing during a weak/choppy trend (low ADX)
+
+Each flag adds to a **Risk Score** — 0 is clean, 35+ means "skip or micro-size."
+""")
+
+    with st.expander("💰 Risk Management Basics"):
+        st.markdown("""
+- **Risk:Reward (R:R)**: how much you stand to make vs. lose. A 1:2 R:R means your Take-Profit is twice as far from entry as your Stop-Loss.
+- **Position size**: the dollar amount allocated to a trade — this determines your *dollar* risk, not your price risk.
+- **Stop-Loss (SL)**: a price where you exit if the trade goes against you, sized here using the Average True Range (ATR) so it adapts to each asset's volatility.
+- **Expectancy**: `(win rate × average win) − (loss rate × average loss)`. A system can win less than 50% of the time and still be profitable if winners are big enough relative to losers — that's what the Backtest tab measures.
+- **Rule of thumb**: many professional traders risk only 0.5–2% of account equity per trade, regardless of how confident a signal looks.
+""")
+
+    st.divider()
+    st.warning(
+        "⚠️ This is educational content, not financial advice. Indicators describe what "
+        "*has already happened* in price/volume — none of them predict the future with certainty. "
+        "Always combine multiple signals, manage risk, and never risk money you can't afford to lose."
+    )
+
+
+def render_simple_view(symbol: str, datasets: dict, masters: dict, scalp: dict,
+                        confluence: float, rr: float, pos_size: float):
+    """Condensed, beginner-friendly view: best current setup only, plain-English."""
+    st.subheader(f"🎯 {symbol} — Simple View")
+
+    # Pick the "best" master signal = furthest from neutral (50)
+    best_key, best = max(masters.items(), key=lambda kv: abs(kv[1]['score'] - 50))
+    style_map = {'scalp': 'Scalp', 'intraday': 'Intraday', 'swing': 'Swing'}
+    style = style_map.get(best_key, 'Intraday')
+    direction = "LONG" if "BUY" in best['signal'] else "SHORT" if "SELL" in best['signal'] else None
+
+    css = _sig_card_css(best['signal'])
+    icon = _sig_icon(best['signal'])
+    st.markdown(f"""
+    <div class="sig-card {css}" style="padding:30px;">
+        <div class="sig-label">BEST CURRENT SETUP · {style.upper()}</div>
+        <div class="sig-main" style="font-size:38px;">{icon} {best['signal']}</div>
+        <div class="sig-score">Confluence Score: {confluence:.0f} / 100</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if direction:
+        price = datasets['1h']['Close'].iloc[-1]
+        atr = add_indicators(datasets['1h'])['ATR'].iloc[-1]
+        t = calc_trade(price, atr, direction, style, rr)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entry", f"${t['entry']:,.4f}")
+        c2.metric("🛑 Stop-Loss", f"${t['sl']:,.4f}")
+        c3.metric("🎯 Take-Profit", f"${t['tp']:,.4f}")
+        st.caption(f"Risking ${pos_size * t['risk_pct'] / 100:,.2f} of your ${pos_size:,.0f} position size at 1:{rr:.1f} R:R.")
+
+        plain = "buying" if direction == "LONG" else "shorting/selling"
+        st.info(
+            f"**In plain English:** most indicators across timeframes currently favor {plain} "
+            f"{symbol}, with a confluence score of {confluence:.0f}/100. "
+            "This is not financial advice — always confirm with your own research."
+        )
+        render_export_card_button(symbol, direction, style, t, confluence, key="export_simple")
+    else:
+        st.info("No high-conviction setup right now — the signals are mixed. Sitting out is a valid choice.")
+
+    st.divider()
+    st.caption("Want the full technical breakdown (chart, all timeframes, order flow, divergence)? Switch to **🧠 Pro** mode in the sidebar.")
+
 
 def render_news():
     st.subheader("📰 Live Market News")
@@ -1634,6 +2226,15 @@ with st.sidebar.expander("🔑 Binance API (Optional)"):
     if not st.session_state.api_key:
         st.caption("ℹ️ No key needed for public market data.")
 
+# Display mode — Simple for beginners/TikTok traffic, Pro for full dashboard
+st.session_state.display_mode = st.sidebar.radio(
+    "Display Mode", ["🎯 Simple", "🧠 Pro"],
+    index=["🎯 Simple", "🧠 Pro"].index(st.session_state.get('display_mode', '🎯 Simple')),
+    horizontal=True, key="display_mode_radio",
+)
+st.sidebar.caption("Simple = best setup only · Pro = full technical dashboard")
+st.sidebar.divider()
+
 # View mode
 view_mode = st.sidebar.radio("View Mode", ["Single Asset", "Multi-Asset"], index=0)
 
@@ -1672,10 +2273,25 @@ else:
 
 st.sidebar.divider()
 
-# Risk
+# Risk (tap-friendly presets — most traffic is mobile)
 st.sidebar.subheader("💰 Risk Management")
-rr         = st.sidebar.slider("Risk : Reward", 1.0, 4.0, 2.0, 0.5)
-pos_size   = st.sidebar.number_input("Position Size ($)", 100, 1_000_000, 1000, 100)
+
+rr_choice = st.sidebar.radio(
+    "Risk : Reward", ["1:1", "1:2", "1:3", "1:4"],
+    index=1, horizontal=True, key="rr_choice",
+)
+rr = float(rr_choice.split(":")[1])
+
+pos_choice = st.sidebar.radio(
+    "Position Size ($)", ["100", "500", "1,000", "5,000", "Custom"],
+    index=2, horizontal=True, key="pos_choice",
+)
+if pos_choice == "Custom":
+    pos_size = st.sidebar.number_input(
+        "Custom Amount ($)", 100, 1_000_000, 1000, 100, key="pos_custom"
+    )
+else:
+    pos_size = float(pos_choice.replace(",", ""))
 
 # Alerts
 st.sidebar.divider()
@@ -1702,8 +2318,6 @@ st.divider()
 
 # ─── MAIN CONTENT ────────────────────────────
 def full_asset_page(symbol: str):
-    st.subheader(f"📊 {symbol}")
-
     with st.spinner(f"Loading {symbol} data from Binance..."):
         datasets = get_all_datasets(symbol)
 
@@ -1712,66 +2326,106 @@ def full_asset_page(symbol: str):
 
     news = get_news()
 
-    # ═══════════════════════════════════════════
-    # 🔝  SIGNALS ON TOP  (highest priority)
-    # ═══════════════════════════════════════════
-    st.markdown("## 🎯 Live Trading Signals")
-
-    # 15m scalp
+    # 15m scalp + master signals (needed by both Simple and Pro views)
     scalp = generate_15m_scalp_signal(datasets['15m'], datasets['1h'])
-    # Master signals
     masters = calc_master_signal(datasets, scalp)
 
-    render_master_signal_cards(masters)
-    st.divider()
-    render_scalp_detail(scalp)
-    st.divider()
+    if st.session_state.get('display_mode', '🎯 Simple') == '🎯 Simple':
+        # ═══════════════════════════════════════
+        # SIMPLE MODE — condensed, beginner-friendly
+        # ═══════════════════════════════════════
+        confluence_score = _quick_confluence_estimate(datasets, news)
+        render_simple_view(symbol, datasets, masters, scalp, confluence_score, rr, pos_size)
+        return
 
     # ═══════════════════════════════════════════
-    # CONFLICT CHECK
+    # PRO MODE — full institutional dashboard
     # ═══════════════════════════════════════════
+    st.subheader(f"📊 {symbol}")
+
     all_sigs_for_conflict = {}
     for tf in ['15m', '1h', '4h']:
         df = add_indicators(datasets[tf])
         all_sigs_for_conflict[tf] = generate_signal(df, tf)
     conflict = detect_conflicts(datasets, all_sigs_for_conflict)
+
+    st.markdown("## 🎯 Live Trading Signals")
+    render_master_signal_cards(masters)
+    st.divider()
+    render_scalp_detail(scalp)
+    st.divider()
+
     render_conflict_panel(conflict)
     st.divider()
 
-    # ═══════════════════════════════════════════
-    # CONFLUENCE
-    # ═══════════════════════════════════════════
-    render_confluence_panel(symbol, datasets, news)
+    confluence_score = render_confluence_panel(symbol, datasets, news)
     st.divider()
 
-    # ═══════════════════════════════════════════
-    # TIMEFRAME SCANNER + TRADE SETUPS
-    # ═══════════════════════════════════════════
-    render_timeframe_scanner(datasets, rr, pos_size)
+    render_divergence_fib_panel(datasets)
     st.divider()
 
-    # ═══════════════════════════════════════════
-    # CHART
-    # ═══════════════════════════════════════════
+    render_timeframe_scanner(datasets, rr, pos_size, symbol=symbol, confluence=confluence_score)
+    st.divider()
+
     render_chart(datasets)
     st.divider()
 
-    # ═══════════════════════════════════════════
-    # NEWS
-    # ═══════════════════════════════════════════
     render_news()
 
 
-# ─── ROUTING ─────────────────────────────────
-if view_mode == "Single Asset":
-    full_asset_page(st.session_state.current_symbol)
+def _quick_confluence_estimate(datasets: dict, news: list) -> float:
+    """Lightweight confluence estimate for Simple Mode (avoids re-rendering the full Pro panel)."""
+    df1h = add_indicators(datasets['1h'])
+    df15 = add_indicators(datasets['15m'])
+    regime = detect_regime(df1h)
+    order_flow = detect_order_flow(df15)
+    regime_score = {'High': 80, 'Medium': 55, 'Low': 30}.get(regime['confidence'] if regime else 'Low', 50)
+    of_score = max(0, min(100, 50 + order_flow['strength'] * 10))
+    sig1h = generate_signal(df1h, '1h')
+    tech_score = sig1h['Score'] if sig1h else 50
+    news_score = 50
+    bullish_kw = ['surge', 'rally', 'bullish', 'gain', 'rise', 'adoption', 'partnership']
+    bearish_kw = ['crash', 'drop', 'decline', 'bearish', 'ban', 'fear', 'liquidation']
+    for item in news[:6]:
+        title = item['title'].lower()
+        news_score += (sum(1 for w in bullish_kw if w in title) - sum(1 for w in bearish_kw if w in title)) * 6
+    news_score = max(0, min(100, news_score))
+    return tech_score * 0.40 + regime_score * 0.25 + of_score * 0.20 + news_score * 0.15
 
-else:
-    col_a, col_b = st.columns(2)
-    with col_a:
-        full_asset_page(st.session_state.symbol_1)
-    with col_b:
-        full_asset_page(st.session_state.symbol_2)
+
+# ─── ROUTING (Signals tab) ────────────────────
+def render_signals_tab():
+    if view_mode == "Single Asset":
+        full_asset_page(st.session_state.current_symbol)
+    else:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            full_asset_page(st.session_state.symbol_1)
+        with col_b:
+            full_asset_page(st.session_state.symbol_2)
+
+
+tab_signals, tab_backtest, tab_learn = st.tabs(["📊 Signals", "🕰️ Backtest", "📚 Learn"])
+with tab_signals:
+    render_signals_tab()
+with tab_backtest:
+    render_backtest_tab()
+with tab_learn:
+    render_education_tab()
+
+# ─── FOOTER / DISCLAIMER ──────────────────────
+st.divider()
+st.markdown(
+    """
+    <div style="text-align:center; padding: 18px 10px; color:#6b7a8d; font-size:13px; line-height:1.6;">
+        ⚠️ <b>Disclaimer:</b> This tool is for educational and informational purposes only.
+        Backtests, signals, and confluence scores are generated by an AI model and do not
+        constitute financial advice. Trading cryptocurrency and leverage carries high risk.
+        Never risk money you cannot afford to lose.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ─── AUTO REFRESH ────────────────────────────
 if st.session_state.auto_refresh:
