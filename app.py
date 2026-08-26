@@ -1297,6 +1297,117 @@ def _market_scanner_symbols(universe, custom_symbols=''):
     return list(dict.fromkeys(s for s in symbols if s))
 
 
+def _telegram_credentials():
+    """Read optional Telegram credentials without ever rendering their values."""
+    try:
+        return str(st.secrets.get('telegram_bot_token', '')).strip(), str(st.secrets.get('telegram_chat_id', '')).strip()
+    except Exception:
+        return '', ''
+
+
+def send_telegram_alert(message):
+    """Send one scanner alert. Returns a safe status message, never a credential."""
+    token, chat_id = _telegram_credentials()
+    if not token or not chat_id:
+        return False, 'Telegram is not configured.'
+    try:
+        response = requests.post(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            json={'chat_id': chat_id, 'text': message}, timeout=12
+        )
+        if response.ok:
+            return True, 'Telegram alert sent.'
+        return False, 'Telegram rejected the alert. Check bot token and chat ID.'
+    except Exception:
+        return False, 'Could not reach Telegram.'
+
+
+def get_telegram_chat_candidates():
+    """Return chat IDs that have messaged this bot, without exposing its token."""
+    token, _ = _telegram_credentials()
+    if not token:
+        return [], 'Add telegram_bot_token to .streamlit/secrets.toml first.'
+    try:
+        response = requests.get(f'https://api.telegram.org/bot{token}/getUpdates', timeout=12)
+        payload = response.json() if response.ok else {}
+        chats = {}
+        for update in payload.get('result', []):
+            message = update.get('message') or update.get('edited_message') or update.get('channel_post') or {}
+            chat = message.get('chat') or {}
+            chat_id = chat.get('id')
+            if chat_id is not None:
+                name = ' '.join(part for part in [chat.get('first_name', ''), chat.get('last_name', '')] if part).strip()
+                label = name or chat.get('title') or chat.get('username') or 'Telegram chat'
+                chats[str(chat_id)] = label
+        if not chats:
+            return [], 'No messages found. Open your bot in Telegram and send /start, then try again.'
+        return [{'chat_id': key, 'label': value} for key, value in chats.items()], ''
+    except Exception:
+        return [], 'Could not contact Telegram. Confirm the bot token is valid and restart Streamlit after saving secrets.'
+
+
+def _append_signal_journal(row, timeframe):
+    """Persist confirmed alerts locally for later paper-trade review."""
+    try:
+        os.makedirs('.cache', exist_ok=True)
+        path = os.path.join('.cache', 'strict_signal_journal.csv')
+        record = dict(row)
+        record.update({'Timeframe': timeframe, 'Logged At': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+        pd.DataFrame([record]).to_csv(path, mode='a', header=not os.path.exists(path), index=False)
+    except Exception:
+        pass
+
+
+def evaluate_market_scan_symbol(symbol, timeframe):
+    """Classify one instrument as confirmed, watchlist, or no setup."""
+    data_sets = get_data(symbol)
+    if not data_sets or timeframe not in data_sets:
+        return None, 'unavailable'
+    df = add_indicators(data_sets[timeframe].copy())
+    if df is None or len(df) < 60:
+        return None, 'insufficient history'
+    core = _precision_master_core(df, timeframe)
+    strict = generate_master_strict_signal(df, timeframe, data_sets=data_sets)
+    candle_time = str(df.index[-1])
+    base = {
+        'Symbol': symbol,
+        'Side': 'LONG' if core.get('signal') == 'UP' else 'SHORT',
+        'Technical': round(float(core.get('quality', 0)) * 100, 1),
+        'Regime': core.get('regime', '—'),
+        'Last Candle': candle_time,
+    }
+    if strict and strict.get('signal') in ('UP', 'DOWN'):
+        base.update({
+            'Status': 'CONFIRMED STRICT TRADE',
+            'Side': 'LONG' if strict['signal'] == 'UP' else 'SHORT',
+            'Confidence': round(float(strict.get('confidence', 0)) * 100, 1),
+            'Model': round(float(strict.get('model_confidence', 0)) * 100, 1),
+            'Entry': float(strict.get('entry', 0)), 'Target': float(strict.get('tp', 0)),
+            'Stop': float(strict.get('sl', 0)),
+            'Context': round(float(strict.get('context_score', 0)) * 100, 1),
+            'Why Waiting': '',
+            'Alert ID': f"{symbol}|{timeframe}|{strict['signal']}|{candle_time}",
+        })
+        return base, 'confirmed'
+
+    # A forming setup must still have a directional, reasonably strong technical core.
+    # It is explicitly NOT a trade instruction: it is shown so the user can watch it.
+    if core.get('signal') in ('UP', 'DOWN') and float(core.get('quality', 0)) >= 0.55:
+        why = '; '.join((strict or {}).get('reasons', [])[-2:]) or 'Needs more strict-master confirmation.'
+        context_score, _, context_available = _timeframe_context_score(data_sets, core['signal'])
+        base.update({
+            'Status': 'SETUP FORMING — DO NOT TRADE YET',
+            'Confidence': round(float((strict or {}).get('confidence', core.get('quality', 0))) * 100, 1),
+            'Model': round(float((strict or {}).get('model_confidence', 0)) * 100, 1),
+            'Entry': np.nan, 'Target': np.nan, 'Stop': np.nan,
+            'Context': round(float(context_score) * 100, 1) if context_available else np.nan,
+            'Why Waiting': why,
+            'Alert ID': '',
+        })
+        return base, 'watch'
+    return None, 'no setup'
+
+
 def run_strict_market_scan(symbols, timeframe):
     """Evaluate the existing Precision Master on every symbol in a chosen universe."""
     matches, skipped = [], []
@@ -1341,44 +1452,76 @@ def render_strict_market_scanner():
 
     symbols = _market_scanner_symbols(universe, custom_symbols)
     st.caption(f'{len(symbols)} symbols selected. For broader coverage, paste any Yahoo Finance tickers into Custom tickers.')
+    token, chat_id = _telegram_credentials()
+    telegram_ready = bool(token and chat_id)
+    alert_cols = st.columns([3, 2])
+    with alert_cols[0]:
+        send_telegram = st.checkbox('Send Telegram alerts for newly confirmed strict trades', value=False,
+                                    key='strict_scan_send_telegram', disabled=not telegram_ready,
+                                    help='One alert per symbol, direction, timeframe, and latest data candle while this app session is open.')
+    with alert_cols[1]:
+        if telegram_ready:
+            if st.button('Send Telegram test', key='strict_scan_telegram_test'):
+                ok, message = send_telegram_alert('Pro AI Trader test: Telegram alerts are connected.')
+                (st.success if ok else st.error)(message)
+        else:
+            st.caption('Telegram not configured yet.')
+    if token and not chat_id:
+        if st.button('Find Telegram Chat ID', key='strict_scan_find_chat_id'):
+            candidates, message = get_telegram_chat_candidates()
+            if candidates:
+                st.success('Found the following chat ID(s). Copy your personal chat ID into telegram_chat_id in .streamlit/secrets.toml, then restart the app.')
+                st.dataframe(pd.DataFrame(candidates), use_container_width=True, hide_index=True)
+            else:
+                st.warning(message)
     if st.button('Run Strict Master Scan', type='primary', key='run_strict_market_scan', disabled=not symbols):
         progress = st.progress(0, text='Starting strict market scan…')
         status = st.empty()
         # Keep results in session state so they remain visible after opening a chart.
-        matches, skipped = [], []
+        matches, watchlist, skipped = [], [], []
+        seen_alerts = st.session_state.setdefault('strict_scan_alert_ids', set())
+        alerts_sent = 0
         for index, symbol in enumerate(symbols, start=1):
             status.caption(f'Scanning {symbol} ({index}/{len(symbols)})')
             try:
-                data_sets = get_data(symbol)
-                if not data_sets or timeframe not in data_sets:
+                row, state = evaluate_market_scan_symbol(symbol, timeframe)
+                if state in ('unavailable', 'insufficient history'):
                     skipped.append(symbol)
-                else:
-                    result = generate_master_strict_signal(add_indicators(data_sets[timeframe].copy()), timeframe, data_sets=data_sets)
-                    if result and result.get('signal') in ('UP', 'DOWN'):
-                        matches.append({
-                            'Symbol': symbol, 'Side': 'LONG' if result['signal'] == 'UP' else 'SHORT',
-                            'Confidence': round(float(result.get('confidence', 0)) * 100, 1),
-                            'Technical': round(float(result.get('technical_quality', 0)) * 100, 1),
-                            'Model': round(float(result.get('model_confidence', 0)) * 100, 1),
-                            'Entry': float(result.get('entry', 0)), 'Target': float(result.get('tp', 0)),
-                            'Stop': float(result.get('sl', 0)), 'Regime': result.get('regime', '—'),
-                            'Context': round(float(result.get('context_score', 0)) * 100, 1),
-                        })
+                elif state == 'confirmed' and row:
+                    matches.append(row)
+                    alert_id = row.get('Alert ID', '')
+                    if alert_id and alert_id not in seen_alerts:
+                        _append_signal_journal(row, timeframe)
+                        seen_alerts.add(alert_id)
+                        if send_telegram:
+                            text = (f"CONFIRMED STRICT TRADE\n{row['Symbol']} · {row['Side']} · {timeframe}\n"
+                                    f"Confidence: {row['Confidence']}%\nEntry: {row['Entry']:.4f}\n"
+                                    f"Target: {row['Target']:.4f}\nStop: {row['Stop']:.4f}\n"
+                                    f"Data candle: {row['Last Candle']}\nReview before placing any order.")
+                            ok, _ = send_telegram_alert(text)
+                            alerts_sent += int(ok)
+                elif state == 'watch' and row:
+                    watchlist.append(row)
             except Exception:
                 skipped.append(symbol)
             progress.progress(index / len(symbols), text=f'Scanned {index}/{len(symbols)} symbols')
         st.session_state.strict_scan_results = sorted(matches, key=lambda item: item['Confidence'], reverse=True)
+        st.session_state.strict_scan_watchlist = sorted(watchlist, key=lambda item: item['Technical'], reverse=True)
         st.session_state.strict_scan_skipped = skipped
-        st.session_state.strict_scan_meta = {'universe': universe, 'timeframe': timeframe, 'total': len(symbols), 'scanned_at': datetime.now()}
+        st.session_state.strict_scan_meta = {'universe': universe, 'timeframe': timeframe, 'total': len(symbols), 'scanned_at': datetime.now(), 'alerts_sent': alerts_sent}
         status.empty()
 
     results = st.session_state.get('strict_scan_results')
+    watchlist = st.session_state.get('strict_scan_watchlist')
     meta = st.session_state.get('strict_scan_meta', {})
     if results is not None:
         st.markdown(f"### Passing Strict Master Trades: {len(results)}")
         st.caption(f"Results from {meta.get('total', 0)} symbols · {meta.get('timeframe', '—')} · scanned {meta.get('scanned_at', datetime.now()).strftime('%H:%M:%S')}")
+        if meta.get('alerts_sent', 0):
+            st.success(f"Sent {meta['alerts_sent']} new Telegram alert(s).")
         if results:
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+            display_results = pd.DataFrame(results).drop(columns=['Alert ID'], errors='ignore')
+            st.dataframe(display_results, use_container_width=True, hide_index=True)
             selected = st.selectbox('Open a matching symbol', [row['Symbol'] for row in results], key='strict_scan_open_symbol')
             if st.button('Analyze selected signal', key='strict_scan_open_button'):
                 st.session_state.current_symbol = selected
@@ -1387,8 +1530,16 @@ def render_strict_market_scanner():
                 _safe_rerun()
         else:
             st.info('No instruments passed every strict-master filter in this scan. That is expected when the market does not offer a high-quality setup.')
+        st.markdown(f"### Setup Forming - Watch, Do Not Trade Yet: {len(watchlist or [])}")
+        st.caption('These have a directional technical base but did not pass the full strict confirmation. The Why Waiting column tells you what is missing.')
+        if watchlist:
+            display_watchlist = pd.DataFrame(watchlist).drop(columns=['Alert ID'], errors='ignore')
+            st.dataframe(display_watchlist, use_container_width=True, hide_index=True)
         if st.session_state.get('strict_scan_skipped'):
             st.caption(f"Skipped {len(st.session_state.strict_scan_skipped)} symbol(s) with unavailable or insufficient Yahoo data.")
+
+    with st.expander('How confirmed alerts work', expanded=False):
+        st.markdown('A confirmed alert is an analysis prompt, not an automatic order. Each new confirmed signal is saved in `.cache/strict_signal_journal.csv` for paper-trade review. Repeated scans during the same app session do not re-alert the same symbol, direction, timeframe, and data candle.')
 
 # --- 2. ADVANCED TECHNICAL INDICATORS ---
 def add_indicators(df):
