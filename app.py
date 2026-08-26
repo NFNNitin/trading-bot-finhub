@@ -2474,6 +2474,61 @@ def detect_signal_conflicts(data_sets, analysis_results):
     }
 
 # --- 7. MASTER SIGNAL CALCULATOR (ALL-IN-ONE) ---
+def _advanced_signal_direction(signal_data):
+    """Map a displayed technical signal to one unambiguous direction."""
+    label = str((signal_data or {}).get('Signal', '')).upper()
+    if 'BUY' in label and 'SELL' not in label:
+        return 'UP'
+    if 'SELL' in label and 'BUY' not in label:
+        return 'DOWN'
+    return 'NEUTRAL'
+
+
+def _refresh_master_label(slot, score, risk_score):
+    """Keep the displayed label synchronized with the final blended score."""
+    if slot.get('signal') == 'CAUTION':
+        return
+    score = float(np.clip(score, 0, 100))
+    if slot.get('_style') == 'swing':
+        buy, strong_sell, sell = 65, 25, 35
+        risk_ok = True
+    else:
+        buy, strong_sell, sell = 60, 25, 40
+        risk_ok = risk_score < (25 if slot.get('_style') == 'scalping' else 30)
+    if score >= 75 and risk_ok:
+        slot['signal'], slot['confidence'] = 'STRONG BUY', 'Very High'
+    elif score >= buy and risk_ok:
+        slot['signal'], slot['confidence'] = 'BUY', 'High'
+    elif score <= strong_sell and risk_ok:
+        slot['signal'], slot['confidence'] = 'STRONG SELL', 'Very High'
+    elif score <= sell and risk_ok:
+        slot['signal'], slot['confidence'] = 'SELL', 'High'
+    else:
+        slot['signal'], slot['confidence'] = 'NEUTRAL', 'Low'
+
+
+def _apply_master_consensus_gate(master_signals, analysis_results):
+    """Turn conflicting or neutral timeframe evidence into a non-actionable state.
+
+    Raw timeframe cards remain visible for analysis, but the three prominent
+    Master cards must never issue an actionable instruction while the market
+    has no shared directional consensus.
+    """
+    timeframes = ('5m', '15m', '30m', '1h', '4h')
+    directions = {tf: _advanced_signal_direction(analysis_results.get(tf)) for tf in timeframes}
+    unique_directions = set(directions.values())
+    if unique_directions == {'UP'} or unique_directions == {'DOWN'}:
+        return
+
+    summary = ', '.join(f"{tf} {direction}" for tf, direction in directions.items())
+    for slot in master_signals.values():
+        slot['signal'] = 'CAUTION'
+        slot['confidence'] = 'Low'
+        slot['reasons'].append(
+            f"⚠️ Master consensus gate: {summary}. No trade until all timeframes align."
+        )
+
+
 def calculate_master_signal(data_sets, analysis_results, conflict_analysis):
     """
     The ULTIMATE signal calculator that considers EVERYTHING:
@@ -2490,9 +2545,9 @@ def calculate_master_signal(data_sets, analysis_results, conflict_analysis):
     """
     
     master_signals = {
-        'scalping': {'signal': 'NEUTRAL', 'confidence': 0, 'score': 0, 'reasons': []},
-        'intraday': {'signal': 'NEUTRAL', 'confidence': 0, 'score': 0, 'reasons': []},
-        'swing': {'signal': 'NEUTRAL', 'confidence': 0, 'score': 0, 'reasons': []}
+        'scalping': {'signal': 'NEUTRAL', 'confidence': 0, 'score': 0, 'reasons': [], '_style': 'scalping'},
+        'intraday': {'signal': 'NEUTRAL', 'confidence': 0, 'score': 0, 'reasons': [], '_style': 'intraday'},
+        'swing': {'signal': 'NEUTRAL', 'confidence': 0, 'score': 0, 'reasons': [], '_style': 'swing'}
     }
     
     # Get all necessary data
@@ -2975,6 +3030,15 @@ def calculate_master_signal(data_sets, analysis_results, conflict_analysis):
     except Exception:
         pass
 
+    # Meta blending changes the numeric score; recompute labels afterwards so
+    # a stale pre-blend BUY/SELL label cannot remain on screen.
+    for slot in master_signals.values():
+        _refresh_master_label(slot, slot.get('score', 0), risk_score)
+
+    # A neutral or contradictory timeframe is information, not permission to
+    # trade.  Apply this after every scoring/blending adjustment.
+    _apply_master_consensus_gate(master_signals, analysis_results)
+
     # --- RSI Overbought Exponential Penalty ---
     try:
         rsi_1h_val = float(curr_1h.get('RSI', 0))
@@ -3014,6 +3078,10 @@ def calculate_master_signal(data_sets, analysis_results, conflict_analysis):
                     sig['confidence'] = 'Low'
     except Exception:
         pass
+
+    # Internal rendering metadata is not part of the public signal result.
+    for slot in master_signals.values():
+        slot.pop('_style', None)
 
     return master_signals
 
