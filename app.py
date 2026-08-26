@@ -514,9 +514,10 @@ def detect_fvg_liquidity_msb(df):
 
 
 def compute_cvd_approx(df, window=20):
-    """Approximate Cumulative Volume Delta using candle direction * volume.
-    Returns a normalized CVD between -1 and +1 for the window (negative = selling pressure).
-    This is an approximation when tick-level trades are not available.
+    """Return a signed candle-volume proxy, normalized to -1..+1.
+
+    This is not true CVD: OHLCV candles do not identify the aggressor side of
+    each trade. It is retained as a weak confirmation feature only.
     """
     try:
         if df is None or len(df) < 2:
@@ -1075,14 +1076,19 @@ def detect_market_regime(df):
     ema_alignment = df['EMA9'].iloc[-1] > df['EMA21'].iloc[-1] > df['EMA50'].iloc[-1]
     
     # Determine regime
-    if adx > 25 and ema_alignment:
+    bearish_alignment = df['EMA9'].iloc[-1] < df['EMA21'].iloc[-1] < df['EMA50'].iloc[-1]
+    if adx > 25 and ema_alignment and above_ema200:
         regime = "📈 Strong Trend"
         strategy = "Trend Following"
         confidence = "High"
-    elif adx > 25:
+    elif adx > 25 and bearish_alignment and not above_ema200:
         regime = "📉 Strong Trend (Bearish)"
         strategy = "Trend Following (Short)"
         confidence = "High"
+    elif adx > 25:
+        regime = "🌊 Transitional Trend"
+        strategy = "Wait for directional alignment"
+        confidence = "Low"
     elif adx < 20 and bb_width < 0.04:
         regime = "📊 Tight Range"
         strategy = "Mean Reversion"
@@ -1116,7 +1122,8 @@ def calculate_confluence_score(df, sentiment_data, order_flow, regime):
     
     current_price = df['Close'].iloc[-1]
     
-    # 1. MACRO FILTER (Sentiment) - 20% weight
+    # 1. MACRO FILTER (Sentiment) - 20% weight. Keep direction separate
+    # from setup quality so bearish alignment can be a valid setup.
     if sentiment_data:
         sentiment_contribution = sentiment_data['score'] / 100  # Normalize to 0-1
         scores['sentiment'] = sentiment_contribution
@@ -1151,6 +1158,12 @@ def calculate_confluence_score(df, sentiment_data, order_flow, regime):
         technical_score += 0.4
     if ema9 > ema21 > ema50:
         technical_score += 0.6
+
+    bearish_technical_score = 0
+    if current_price < ema200:
+        bearish_technical_score += 0.4
+    if ema9 < ema21 < ema50:
+        bearish_technical_score += 0.6
     
     scores['technical'] = technical_score
     weights['technical'] = 0.30
@@ -1191,8 +1204,29 @@ def calculate_confluence_score(df, sentiment_data, order_flow, regime):
     except:
         sell_spike = False
 
-    # Calculate weighted confluence
-    total_score = sum(scores[key] * weights[key] for key in scores.keys())
+    # Setup quality answers "how aligned is it?" Direction answers "which way?".
+    # Previously negative sentiment reduced a bullish-only score, making a strong
+    # short look like a weak setup.
+    technical_direction = technical_score - bearish_technical_score
+    flow_direction = float(np.clip((order_flow or {}).get('strength', 0) / 5.0, -1.0, 1.0))
+    direction_score = (
+        scores['sentiment'] * weights['sentiment'] +
+        technical_direction * weights['technical'] +
+        flow_direction * weights['order_flow']
+    )
+    if direction_score > 0.08:
+        direction = 'BULLISH'
+    elif direction_score < -0.08:
+        direction = 'BEARISH'
+    else:
+        direction = 'NEUTRAL'
+    total_score = (
+        abs(scores['sentiment']) * weights['sentiment'] +
+        scores['regime'] * weights['regime'] +
+        abs(technical_direction) * weights['technical'] +
+        abs(flow_direction) * weights['order_flow'] +
+        scores['volume'] * weights['volume']
+    )
 
     # Apply CVD override: if aggressive selling detected, reduce confluence sharply
     if sell_spike:
@@ -1202,6 +1236,8 @@ def calculate_confluence_score(df, sentiment_data, order_flow, regime):
 
     return {
         'total_score': total_score,
+        'direction': direction,
+        'direction_score': direction_score,
         'component_scores': scores,
         'weights': weights,
         'cvd': cvd,
@@ -1222,14 +1258,18 @@ def get_data(symbol):
     Fetches granular data and resamples it to generate 5m, 15m, 30m, 1h, and 4h datasets.
     """
     try:
-        # Fetch 5 days of 5m data
-        df_5m = yf.download(symbol, period="5d", interval="5m", progress=False)
+        # Yahoo supports limited intraday history. 60 days of 5m data provides
+        # enough warm-up for the short timeframes; 730 days of 1h data provides
+        # a meaningful 4h EMA-200 after resampling.
+        df_5m = yf.download(symbol, period="60d", interval="5m", progress=False,
+                            auto_adjust=False, threads=False)
         
-        # Fetch 1 month of 1h data
-        df_1h = yf.download(symbol, period="1mo", interval="1h", progress=False)
+        df_1h = yf.download(symbol, period="730d", interval="1h", progress=False,
+                            auto_adjust=False, threads=False)
         
         # Fetch daily data for longer-term analysis
-        df_1d = yf.download(symbol, period="6mo", interval="1d", progress=False)
+        df_1d = yf.download(symbol, period="2y", interval="1d", progress=False,
+                            auto_adjust=False, threads=False)
         
         if df_5m.empty or df_1h.empty: return None
 
@@ -1543,13 +1583,20 @@ def render_strict_market_scanner():
 
 # --- 2. ADVANCED TECHNICAL INDICATORS ---
 def add_indicators(df):
-    if len(df) < 50: return df
+    """Calculate indicators with Wilder-style smoothing and explicit warm-ups.
+
+    A partially warmed EMA-200 or ADX must not be treated as a fully formed
+    indicator. Downstream strict-signal gates reject rows with missing values.
+    """
+    if df is None or len(df) < 50:
+        return df
+    df = df.copy()
     
     # Trend Indicators
-    df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+    df['EMA9'] = df['Close'].ewm(span=9, adjust=False, min_periods=9).mean()
+    df['EMA21'] = df['Close'].ewm(span=21, adjust=False, min_periods=21).mean()
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False, min_periods=50).mean()
+    df['EMA200'] = df['Close'].ewm(span=200, adjust=False, min_periods=200).mean()
     
     # Bollinger Bands
     df['BB_Middle'] = df['Close'].rolling(window=20).mean()
@@ -1559,8 +1606,8 @@ def add_indicators(df):
     
     # Momentum - RSI
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     rs = gain / (loss + 1e-9)
     df['RSI'] = 100 - (100 / (1 + rs))
     
@@ -1578,20 +1625,20 @@ def add_indicators(df):
     df['MACD_Hist'] = df['MACD'] - df['Signal']
     
     # ADX (Trend Strength)
-    plus_dm = df['High'].diff()
-    minus_dm = -df['Low'].diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
+    up_move = df['High'].diff()
+    down_move = -df['Low'].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
     
     tr = pd.concat([df['High'] - df['Low'], 
                     abs(df['High'] - df['Close'].shift()), 
                     abs(df['Low'] - df['Close'].shift())], axis=1).max(axis=1)
     
-    atr = tr.rolling(window=14).mean()
-    plus_di = 100 * (plus_dm.rolling(window=14).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window=14).mean() / atr)
+    atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr)
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    df['ADX'] = dx.rolling(window=14).mean()
+    df['ADX'] = dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     
     # ATR for Stop Loss
     high_low = df['High'] - df['Low']
@@ -1599,7 +1646,7 @@ def add_indicators(df):
     low_close = np.abs(df['Low'] - df['Close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     true_range = np.max(ranges, axis=1)
-    df['ATR'] = true_range.rolling(14).mean()
+    df['ATR'] = true_range.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     
     # Volume Analysis
     df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
@@ -3048,26 +3095,24 @@ def run_backtest(df, timeframe_name, periods_ahead=1):
     return results
 
 def tune_blend_weight_for_timeframe(df, timeframe, samples=10):
-    """Try several blend weights and return best blend based on direction accuracy."""
-    best = {'blend': st.session_state.meta_rule_blend, 'acc': 0}
-    weights = np.linspace(0.0, 1.0, 11)
-    for w in weights:
-        # run quick backtest using this blend
-        # temporarily set blend
-        original = st.session_state.meta_rule_blend
-        st.session_state.meta_rule_blend = w
-        try:
-            df_ind = add_indicators(df.copy())
-            res = run_backtest(df_ind, timeframe, periods_ahead=1)
-            if res and res['total_predictions'] > 0:
-                acc = res['direction_accuracy']
-                if acc > best['acc']:
-                    best = {'blend': w, 'acc': acc}
-        except Exception:
-            pass
-        finally:
-            st.session_state.meta_rule_blend = original
-    return best
+    """Choose a blend using the probability-aware walk-forward evaluator.
+
+    The former routine changed a session setting that the tested prediction path
+    never used, so every candidate could report the same result.
+    """
+    try:
+        grid = run_wfcv_grid(
+            add_indicators(df.copy()), timeframe,
+            blend_values=np.linspace(0.0, 1.0, 11), conf_values=[0.55, 0.60, 0.65],
+            train_window=min(500, max(250, len(df) // 2)),
+            test_window=min(50, max(20, len(df) // 8)), step=max(20, min(100, len(df) // 8)),
+            horizon=1, samples_per_train=max(40, samples)
+        )
+        if grid:
+            return {'blend': float(grid['best']['blend']), 'acc': float(grid['best']['accuracy'])}
+    except Exception:
+        pass
+    return {'blend': st.session_state.meta_rule_blend, 'acc': 0}
 
 
 def walk_forward_cv(df, timeframe, train_window=500, test_window=50, step=50, horizon=1, samples_per_train=80):
@@ -3213,11 +3258,24 @@ def run_wfcv_grid(df, timeframe, blend_values=None, conf_values=None, train_wind
                     pred_out = predict_price_movement(hist, timeframe)
                     if pred_out is None or model is None:
                         continue
+                    pred_out['df'] = hist
+                    pred_out['rsi'] = hist['RSI'].iloc[-1] if 'RSI' in hist.columns else 50
+                    pred_out['adx'] = hist['ADX'].iloc[-1] if 'ADX' in hist.columns else 20
+                    pred_out['volume_ratio'] = hist['Volume_Ratio'].iloc[-1] if 'Volume_Ratio' in hist.columns else 1.0
                     prob_up = meta_predict_from_model(pred_out, model)
 
-                    # apply blend as simple convex mixture with rule-based confidence if present
-                    rule_conf = pred_out.get('confidence', 0.5)
-                    combined = blend * prob_up + (1 - blend) * rule_conf
+                    # Convert rule confidence (20..95 percent) into a directional
+                    # UP probability before blending it with the meta probability.
+                    # A neutral rule forecast carries no directional opinion.
+                    rule_strength = float(np.clip(float(pred_out.get('confidence', 50)) / 100.0, 0.0, 1.0))
+                    rule_direction = str(pred_out.get('direction', ''))
+                    if 'UP' in rule_direction:
+                        rule_prob = 0.5 + (rule_strength - 0.5)
+                    elif 'DOWN' in rule_direction:
+                        rule_prob = 0.5 - (rule_strength - 0.5)
+                    else:
+                        rule_prob = 0.5
+                    combined = float(np.clip(blend * prob_up + (1 - blend) * rule_prob, 0.0, 1.0))
 
                     # apply feature flags by ignoring certain overrides (best-effort)
                     # (If disabled, we reduce their effect by nudging combined towards 0.5)
@@ -3234,7 +3292,8 @@ def run_wfcv_grid(df, timeframe, blend_values=None, conf_values=None, train_wind
 
                     y_true.append(true_up)
                     y_pred_prob.append(combined)
-                    selected_mask.append(1 if combined >= conf else 0)
+                    # Select confident long *or* short calls symmetrically.
+                    selected_mask.append(1 if abs(combined - 0.5) >= (conf - 0.5) else 0)
 
                 if len(y_true) == 0:
                     continue
@@ -3327,7 +3386,8 @@ def _method_agreement(pred, direction):
             if abs(mv) <= max(abs(current)*0.00005, 1e-9):
                 continue
             signs.append('UP' if mv>0 else 'DOWN')
-        if not signs:
+        # A single non-neutral method cannot establish ensemble agreement.
+        if len(signs) < 3:
             return 0.0
         return float(sum(s==direction for s in signs)/len(signs))
     except Exception:
@@ -3362,12 +3422,16 @@ def _classify_precision_regime(d):
 
 def _precision_master_core(df, timeframe):
     """V7 pure historical scorer: trend + acceleration + structure + volume + abstention."""
-    if df is None or len(df) < 60:
-        return {'signal':'NONE','quality':0.0,'margin':0.0,'reasons':['Insufficient history']}
+    # EMA-200 is a core regime feature. Do not score it before it has a genuine
+    # warm-up, even if shorter indicators happen to be available.
+    if df is None or len(df) < 250:
+        return {'signal':'NONE','quality':0.0,'margin':0.0,'reasons':['Insufficient history for EMA-200 warm-up']}
     d=df.copy()
     required={'EMA9','EMA21','EMA50','EMA200','RSI','MACD','Signal','ADX','Stoch_K','Stoch_D','ATR','Volume_Ratio','BB_Upper','BB_Lower','BB_Middle'}
     if not required.issubset(d.columns):
         d=add_indicators(d)
+    if not required.issubset(d.columns) or d.iloc[-1][list(required)].isna().any():
+        return {'signal':'NONE','quality':0.0,'margin':0.0,'reasons':['Indicators are not fully warmed up']}
     row,prev,prev3=d.iloc[-1],d.iloc[-2],d.iloc[-4]
     price=_safe_float(row['Close'])
     if price<=0:
@@ -3430,7 +3494,7 @@ def _precision_master_core(df, timeframe):
     vote(breakout_up or pullback_up, breakout_dn or pullback_dn, 1.3, 'bullish structure trigger','bearish structure trigger')
 
     cvd=compute_cvd_approx(d,window=20)
-    vote(cvd>0.10,cvd<-0.10,0.8,f'CVD buying {cvd:.2f}',f'CVD selling {cvd:.2f}')
+    vote(cvd>0.10,cvd<-0.10,0.35,f'signed-volume proxy positive {cvd:.2f}',f'signed-volume proxy negative {cvd:.2f}')
 
     # Reject exhausted entry locations.
     max_pts+=0.8
@@ -4069,6 +4133,7 @@ def render_professional_confluence(data_sets, symbol, news_items):
             st.markdown("**MODERATE SETUP** - Mixed signals")
         else:
             st.markdown("**LOW QUALITY** - Conflicting data")
+        st.caption(f"Directional bias: **{confluence.get('direction', 'NEUTRAL')}**")
     
     with col2:
         st.metric("Market Regime", regime['regime'] if regime else "Unknown")
