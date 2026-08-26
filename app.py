@@ -211,7 +211,8 @@ if show_sidebar:
 
     # Strict Master tunables
     st.sidebar.subheader('Strict Master Settings')
-    min_meta_conf = st.sidebar.slider('Min Model Agreement', 0.5, 0.95, 0.65, 0.05)
+    min_meta_conf = st.sidebar.slider('Min Meta Direction Probability', 0.5, 0.95, 0.65, 0.05,
+                                     help='Minimum directional probability from the optional meta model. Method agreement is a separate strict filter.')
     min_rule_conf = st.sidebar.slider('Min Technical Quality', 0.5, 0.95, 0.70, 0.05)
     tp_atr_mult = st.sidebar.slider('TP ATR Multiplier', 0.2, 3.0, 1.0, 0.1)
     sl_atr_mult = st.sidebar.slider('SL ATR Multiplier', 0.2, 3.0, 1.0, 0.1)
@@ -1404,7 +1405,7 @@ def evaluate_market_scan_symbol(symbol, timeframe):
     if not data_sets or timeframe not in data_sets:
         return None, 'unavailable'
     df = add_indicators(data_sets[timeframe].copy())
-    if df is None or len(df) < 60:
+    if df is None or len(df) < 250:
         return None, 'insufficient history'
     core = _precision_master_core(df, timeframe)
     strict = generate_master_strict_signal(df, timeframe, data_sets=data_sets)
@@ -2595,12 +2596,12 @@ def calculate_master_signal(data_sets, analysis_results, conflict_analysis):
         elif sig_5m['Score'] >= 60:
             scalp_score += 12
             scalp_reasons.append(f"✅ Good indicators (Score: {sig_5m['Score']})")
-        elif sig_5m['Score'] <= 40:
-            scalp_score -= 20
-            scalp_reasons.append(f"❌ Weak indicators (Score: {sig_5m['Score']})")
         elif sig_5m['Score'] <= 25:
+            scalp_score -= 20
+            scalp_reasons.append(f"❌ Very weak indicators (Score: {sig_5m['Score']})")
+        elif sig_5m['Score'] <= 40:
             scalp_score -= 12
-            scalp_reasons.append(f"⚠️ Poor indicators (Score: {sig_5m['Score']})")
+            scalp_reasons.append(f"⚠️ Weak indicators (Score: {sig_5m['Score']})")
     
     # 3. RSI Confirmation (Weight: 15 points)
     scalp_max_score += 15
@@ -2695,7 +2696,7 @@ def calculate_master_signal(data_sets, analysis_results, conflict_analysis):
         if curr_5m['Volume'] < (curr_5m['Volume_MA'] * 0.5):
             master_signals['scalping']['signal'] = "CAUTION"
             master_signals['scalping']['confidence'] = "Low"
-            master_signals['scalping']['reasons'].append("⚠️ Downgraded due to low volume (safeguard)")
+            scalp_reasons.append("⚠️ Downgraded due to low volume (safeguard)")
     except Exception:
         pass
     
@@ -3224,6 +3225,7 @@ def walk_forward_cv(df, timeframe, train_window=500, test_window=50, step=50, ho
             pred_out['df'] = hist
             pred_out['rsi'] = hist['RSI'].iloc[-1] if 'RSI' in hist.columns else 50
             pred_out['adx'] = hist['ADX'].iloc[-1] if 'ADX' in hist.columns else 20
+            pred_out['volume_ratio'] = hist['Volume_Ratio'].iloc[-1] if 'Volume_Ratio' in hist.columns else 1.0
             prob_up = meta_predict_from_model(pred_out, model)
 
             current_price = pred_out['current']
@@ -3593,7 +3595,7 @@ def _timeframe_context_score(data_sets, direction):
     score=0.0; used=0.0; details={}
     for tf,w in weights.items():
         try:
-            if tf not in data_sets or data_sets[tf] is None or len(data_sets[tf])<60: continue
+            if tf not in data_sets or data_sets[tf] is None or len(data_sets[tf])<250: continue
             c=_precision_master_core(add_indicators(data_sets[tf].copy()),tf)
             details[tf]=c.get('signal','NONE')
             if c.get('signal')==direction: score+=w*c.get('quality',0); used+=w
@@ -3613,7 +3615,7 @@ def generate_master_strict_signal(df, timeframe, min_meta_conf=0.68, min_rule_co
         min_meta_conf=float(sp.get('min_meta_conf',min_meta_conf)); min_rule_conf=float(sp.get('min_rule_conf',min_rule_conf))
         tp_atr_mult=float(sp.get('tp_atr_mult',tp_atr_mult)); sl_atr_mult=float(sp.get('sl_atr_mult',sl_atr_mult))
         if quality_override is not None: min_rule_conf=float(quality_override)
-        if df is None or len(df)<60: return {'signal':'NONE','confidence':0.0,'reasons':['Insufficient history']}
+        if df is None or len(df)<250: return {'signal':'NONE','confidence':0.0,'reasons':['Insufficient history for EMA-200 warm-up']}
         d=df.copy()
         if 'ATR' not in d.columns or 'EMA200' not in d.columns: d=add_indicators(d)
         core=_precision_master_core(d,timeframe)
@@ -3692,11 +3694,11 @@ def run_backtest_strict_master(df, timeframe, horizon=12, tp_atr_mult=1.25, sl_a
     Uses only information available at each historical point. Candidate quality thresholds
     are calibrated on the older 70% and evaluated on the newest 30% held-out portion.
     """
-    if df is None or len(df)<140:
+    if df is None or len(df)<(250 + horizon + 1):
         return {'total_signals':0,'tp_hits':0,'sl_hits':0,'unresolved':0,'accuracy':0.0,'signals':[],'reason':'Insufficient data'}
     d=df.copy()
     if 'ATR' not in d.columns or 'EMA200' not in d.columns: d=add_indicators(d)
-    first=max(60,len(d)-520); last=len(d)-horizon-1; candidates=[]
+    first=max(250,len(d)-520); last=len(d)-horizon-1; candidates=[]
     for i in range(first,last+1):
         hist=d.iloc[:i+1].copy(); core=_precision_master_core(hist,timeframe)
         if core.get('signal')=='NONE': continue
@@ -4740,6 +4742,31 @@ def render_compact_analysis(data_sets, symbol, risk_reward, position_size):
     render_timeframe_scanner(data_sets, risk_reward, position_size)
 
 
+def get_final_trade_decision(data_sets, analysis_results, timeframe='1h'):
+    """Return the only action-oriented decision shown by the dashboard.
+
+    Timeframe cards are diagnostic views. A LONG or SHORT is allowed only when
+    Precision Master passes technical, prediction, agreement, and context gates.
+    """
+    strict = generate_master_strict_signal(
+        add_indicators(data_sets[timeframe].copy()), timeframe, data_sets=data_sets
+    )
+    directions = {tf: _advanced_signal_direction(signal) for tf, signal in analysis_results.items()}
+    summary = ', '.join(f'{tf} {side}' for tf, side in directions.items())
+    if strict and strict.get('signal') in ('UP', 'DOWN'):
+        return {
+            'action': 'LONG' if strict['signal'] == 'UP' else 'SHORT',
+            'strict': strict,
+            'summary': summary,
+            'reason': 'Precision Master passed its technical, ensemble, and timeframe-context gates.'
+        }
+    reasons = (strict or {}).get('reasons', [])
+    return {
+        'action': 'WAIT', 'strict': strict or {}, 'summary': summary,
+        'reason': reasons[-1] if reasons else 'No confirmed strict setup is available.'
+    }
+
+
 def render_timeframe_scanner(data_sets, risk_reward, position_size):
     """Renders multi-timeframe scanner and AI trade setups"""
     
@@ -4779,6 +4806,24 @@ def render_timeframe_scanner(data_sets, risk_reward, position_size):
                     for signal in sig['Signals'][:3]:
                         st.caption(signal)
     
+    # Diagnostic timeframe cards may differ. This is the single source of truth
+    # for an actionable state: confirmed LONG, confirmed SHORT, or WAIT.
+    final_decision = get_final_trade_decision(data_sets, analysis_results)
+    action = final_decision['action']
+    if action == 'LONG':
+        st.success(f"### FINAL DECISION: LONG\n{final_decision['reason']}")
+    elif action == 'SHORT':
+        st.error(f"### FINAL DECISION: SHORT\n{final_decision['reason']}")
+    else:
+        st.warning(f"### FINAL DECISION: WAIT\n{final_decision['reason']}")
+    st.caption(f"Timeframe diagnostics: {final_decision['summary']}")
+    if action in ('LONG', 'SHORT'):
+        decision_data = final_decision['strict']
+        st.caption(
+            f"Entry {decision_data['entry']:.4f} | Target {decision_data['tp']:.4f} | "
+            f"Stop {decision_data['sl']:.4f} | Precision {decision_data['confidence'] * 100:.1f}%"
+        )
+
     st.divider()
     
     # --- DIVERGENCE & CONFLICT DETECTION ---
